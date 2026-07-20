@@ -1,9 +1,8 @@
 # Milkful — Specification Driven Design (SDD)
 
-This repo implements the **Specification Driven Design** workflow for the Milkful platform,
-adapted from the `spec-driven-designer` skill (see [`milkful2026/milkful-app` → `docs/design/agent-screenshot/`](https://github.com/milkful2026/milkful-app/tree/main/docs/design/agent-screenshot)).
-
-The SDD agent instructions live in [`milkful2026/milkful-app` → `docs/design/agent/spec-driven-designer.md`](https://github.com/milkful2026/milkful-app/blob/main/docs/design/agent/spec-driven-designer.md).
+This repo holds the SDD **output** (specs, workflow artifacts) for the Milkful platform. The
+agent that produces them — the `spec-driven-designer` skill — lives in
+[`milkful2026/agentic-engineering` → `skills/spec-driven-designer.md`](https://github.com/milkful2026/agentic-engineering/blob/main/skills/spec-driven-designer.md).
 
 | Platform | Jira Epic | Area folder | Stack |
 |----------|-----------|-------------|-------|
@@ -118,4 +117,4 @@ Full mapping: `scripts/link-backend-mobile-jira.py`, `scripts/link-admin-backend
 
 **Dry-run mode:** write outputs locally under `~/sdd-tmp/`; skip Jira/Git writes.
 
-**Reference:** [`milkful2026/milkful-app` → `docs/design/agent-screenshot/`](https://github.com/milkful2026/milkful-app/tree/main/docs/design/agent-screenshot) (spec-driven-designer skill screenshots) and [`docs/design/agent/spec-driven-designer.md`](https://github.com/milkful2026/milkful-app/blob/main/docs/design/agent/spec-driven-designer.md) (full agent instructions).
+**Agent instructions:** [`milkful2026/agentic-engineering` → `skills/spec-driven-designer.md`](https://github.com/milkful2026/agentic-engineering/blob/main/skills/spec-driven-designer.md).
