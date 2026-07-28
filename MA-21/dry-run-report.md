@@ -1,24 +1,33 @@
-# SDD Dry-Run Report — MA-21
+# SDD Run Report — MA-21
 
-**Mode:** dry-run (local outputs only; Jira/Git writes skipped — `acli` is not installed/authenticated
-in this environment, and MA-21's Jira status is plain `To Do`, since the custom `SDD: *` workflow
-statuses from the skill are not yet configured on the MA project. Same constraints as the MA-1 pilot.)
+**Mode:** live, with one deliberate exception (see below).
 **Story:** MA-21 User Login
 **Date:** 2026-07-28
 
----
+This story started as a dry-run (see git history on this file for the original dry-run version)
+because `acli` was not installed and MA-21's Jira project had no custom `SDD:*` workflow
+statuses. Both gaps were investigated further; `acli` turned out to be installable, so this run
+went live for everything except status transitions, per an explicit decision to not block on the
+missing workflow statuses.
 
-## Outputs written
+## What actually ran
 
-| Step | File |
-|------|------|
-| 1 | `MA-21/step1-analysis.md` |
-| 2 | `MA-21/step2-context.md` |
-| 3 | `MA-21/step3-decomposition.md` |
-| 4 | `mobile-app/tasks/MA/MA-21/flutter-login-flow.md` |
-| 4 | `services/tasks/MA/MA-21/identity-auth-login.md` |
-| 4 | `services/tasks/MA/MA-21/user-account-type-profile.md` |
-| 5 | `MA-21/step5-review.md` |
+| Action | Result |
+|--------|--------|
+| Install & authenticate `acli` (was missing) | Installed via `winget install Atlassian.AtlassianCLI`; authenticated with the existing `JIRA_EMAIL`/`JIRA_API_TOKEN` |
+| Install & authenticate `gh` (was missing) | Installed via `winget install GitHub.cli`; authenticated with the existing `GH_TOKEN` |
+| Build `tools/md_to_adf.py` | Was flagged "not yet built" by the skill; written and used for all comment postings below |
+| Post Step 1 analysis as a Jira comment on MA-21 | ✅ Done |
+| Post Step 2 context as a Jira comment on MA-21 | ✅ Done |
+| Post Step 3 `SDD-DECOMPOSITION-PROPOSAL` as a Jira comment on MA-21 | ✅ Done |
+| Create Jira Tasks for the 3 approved specs | ✅ MA-105 (Flutter Login Flow), MA-106 (Identity & Auth Login APIs), MA-107 (User Service Account Type & Profile Lookup) |
+| Link each Task to MA-21 | ✅ Done, using **`Relates`** instead of `specifies` — this Jira instance has no `specifies` link type configured (`acli jira workitem link type` only lists Blocks, Cloners, Duplicate, Relates) |
+| Commit spec files + `tools/md_to_adf.py` on `spec/MA-21` | ✅ Commit `593793a` |
+| Push `spec/MA-21` and open the PR | ✅ [github.com/milkful2026/specs/pull/1](https://github.com/milkful2026/specs/pull/1) |
+| Update each Task description with spec file URL + PR URL | ✅ Done |
+| Post the Step 5 review checklist as a comment on each Task | ✅ Done on MA-105, MA-106, MA-107 |
+| Transition MA-21 → `SDD: Building Context` → `SDD: Awaiting Decomposition` → `SDD: In Review` | ❌ **Skipped by decision** — confirmed via a failed test transition that the MA project's Jira workflow has no `SDD:*`/`Spec:*` statuses (`acli jira workitem transition --key MA-21 --status "SDD: Analyzing"` → "No allowed transitions found for given status"). Configuring these requires a human in Jira's workflow editor; MA-21 and its 3 Tasks remain at the default `To Do` status. |
+| Transition MA-105/106/107 → `Spec: In Review` | ❌ Skipped for the same reason |
 
 ## Decisions resolved in chat (not silently assumed)
 
@@ -29,54 +38,30 @@ statuses from the skill are not yet configured on the MA project. Same constrain
 | Entry screen ownership | Reused from MA-1 unchanged; MA-21 builds only the downstream `/login` destination MA-1 already links to |
 | OTP digit count (MA-1 says 6, MA-21 mockup shows 5) | Kept at 6 for backend consistency with MA-1; mockup flagged as needing a design update |
 | B2C/B2B account-type field (doesn't exist yet) | Added in MA-21 as a User Service schema extension + `GET /users/me`, defaulting every account to B2C |
+| Go live without configured `SDD:*` statuses | Yes — go live on comments/Tasks/git/PR; skip only status transitions |
 
-## Skipped actions (would run in live mode)
+## Remaining gaps for a fully live SDD workflow
 
-```
-[SKIPPED] acli jira workitem comment create --key MA-21 --body-file step1-analysis.adf.json
-[SKIPPED] acli jira workitem transition --key MA-21 --status "SDD: Building Context"
+1. **Custom `SDD:*` / `Spec:*` workflow statuses** are not configured on the MA Jira project.
+   Both MA-1 and MA-21 (and their Tasks) sit at the default `To Do` status regardless of actual
+   progress. A Jira admin needs to add these statuses to the project's workflow scheme before
+   status transitions can run for any future story.
+2. **No `specifies` / `is specified by` link type** exists on this Jira instance. Used `Relates`
+   for MA-21's Task↔Story links; the same substitution will be needed for every future story
+   until a custom link type is added (Jira admin action, not something `acli` can create).
 
-[SKIPPED] acli jira workitem comment create --key MA-21 --body-file step2-context.adf.json
-[SKIPPED] acli jira workitem transition --key MA-21 --status "SDD: Awaiting Decomposition"
+## Live artifacts created this run
 
-[SKIPPED] acli jira workitem comment create --key MA-21 --body-file step3-decomposition.adf.json
+- Jira comments: 3 on [MA-21](https://milkfuldairyindia.atlassian.net/browse/MA-21) (Step 1, Step 2, Step 3), 1 each on MA-105/MA-106/MA-107 (Step 5 checklist)
+- Jira Tasks: [MA-105](https://milkfuldairyindia.atlassian.net/browse/MA-105), [MA-106](https://milkfuldairyindia.atlassian.net/browse/MA-106), [MA-107](https://milkfuldairyindia.atlassian.net/browse/MA-107)
+- Git: branch `spec/MA-21`, commit `593793a`
+- PR: [milkful2026/specs#1](https://github.com/milkful2026/specs/pull/1)
 
-[SKIPPED] acli jira workitem create --summary "SDD: MA-21 - Flutter Login Flow" → DRY-6
-[SKIPPED] acli jira workitem create --summary "SDD: MA-21 - Identity & Auth Login APIs" → DRY-7
-[SKIPPED] acli jira workitem create --summary "SDD: MA-21 - User Service Account Type & Profile Lookup" → DRY-8
+## Next steps
 
-[SKIPPED] acli jira workitem link (×3) --link-type "specifies"
-
-[SKIPPED] git checkout -b spec/MA-21
-[SKIPPED] git add mobile-app/tasks/MA/MA-21/*.md services/tasks/MA/MA-21/*.md
-[SKIPPED] git commit -m "spec(MA-21): initial drafts - user login flow"
-[SKIPPED] git push -u origin spec/MA-21
-
-[SKIPPED] gh pr create --title "spec: MA-21 - user login flow" --head spec/MA-21
-
-[SKIPPED] acli jira workitem transition --key MA-21 --status "SDD: In Review"
-[SKIPPED] acli jira workitem transition (×3 tasks) --status "Spec: In Review"
-```
-
----
-
-## Next steps to go live
-
-1. Set up `acli` authenticated against `milkfuldairyindia.atlassian.net` (currently unavailable
-   in this environment — reads were done via direct Jira REST API calls with the token already
-   configured in `.claude/settings.local.json`).
-2. Configure the `SDD: *` / `Spec: *` custom workflow statuses on the MA Jira project — neither
-   MA-1 nor MA-21 currently has these; both stories sit at the default `To Do` status.
-3. Push these local `d:/milkful/specs` changes to the `milkful2026/specs` remote on branch
-   `spec/MA-21` once `git`/`gh` write access is confirmed for that repo.
-4. Run `/spec-driven-designer MA-21` live (or post Steps 1–3 as Jira comments manually from these
-   generated files) once `acli` is available.
-5. Product/design follow-up: reconcile the OTP digit-count mismatch between MA-1's spec and the
-   MA-21 mockup; confirm Log out UI placement.
-
----
-
-## Extend to other stories
-
-Per the specs repo's story map (`README.md`), MA-22 Product Listing (mobile-app + MA-94, MA-95)
-is next in the backlog after MA-21.
+1. Human reviews and merges [PR #1](https://github.com/milkful2026/specs/pull/1).
+2. A Jira admin adds the `SDD:*`/`Spec:*` statuses and a `specifies` link type to the MA project.
+3. Once merged and statuses exist, manually (or via a future agent run) transition MA-21 →
+   `SDD: In Review` and MA-105/106/107 → `Spec: In Review` to bring Jira state in line with
+   actual progress.
+4. Per the specs repo's story map, MA-22 Product Listing (mobile-app + MA-94, MA-95) is next.
