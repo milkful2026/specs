@@ -1,19 +1,20 @@
 # Services — SDD Context
 
-**GitHub Repo:** [`milkful2026/services`](https://github.com/milkful2026/services) (backend microservices monorepo — code not yet implemented)
+**GitHub Repo:** [`milkful2026/services`](https://github.com/milkful2026/services)
 
-**Context Docs** (paths relative to `milkful2026/milkful-app`):
+**Context Docs** (paths relative to `milkful2026/milkful-app` unless noted):
 
 - `docs/design/milkful-well-architected.md`
 - `docs/design/milkful-hld.drawio`
 - `docs/design/milkful-lld.drawio`
 - `docs/design/milkful-messaging.drawio`
-- `docs/jira/attachments/nsmb-app-feature-spec.txt`
+- `README.md` (in `milkful2026/services` — coding principles & guardrails)
 
 ## Description
 
 AWS cloud-native backend for Milkful. **13 microservices** with database-per-service,
-EventBridge event bus, API Gateway BFF, Cognito auth, hybrid **Lambda + ECS Fargate** compute.
+EventBridge domain-event bus, API Gateway BFF, Cognito auth, hybrid **Lambda + ECS Fargate**
+compute, SQS per consumer (with DLQ), SNS last-mile fan-out, and Step Functions sagas.
 
 | Service | Jira | Compute | Datastore |
 |---------|------|---------|-----------|
@@ -34,3 +35,13 @@ EventBridge event bus, API Gateway BFF, Cognito auth, hybrid **Lambda + ECS Farg
 **Jira Epic:** [MA-19 Backend Services](https://milkfuldairyindia.atlassian.net/browse/MA-19)
 
 **Jira Component tag:** `services`
+
+## SDD conventions (backend)
+
+- Specs must name owning service(s), compute type (Lambda vs Fargate), and datastore.
+- Cross-service data only via **APIs or EventBridge events** — never another service's DB.
+- Domain events follow producer/consumer map in `milkful-messaging.drawio`.
+- Document idempotency, retries, DLQ behavior for every consumer.
+- Auth: Cognito JWT at API Gateway; service-to-service SigV4 / mTLS.
+- Observability: correlation ID end-to-end; CloudWatch + X-Ray expectations in NFRs.
+- Spec path: `services/tasks/MA/{STORY-KEY}/{SPEC-KEY}.md`
