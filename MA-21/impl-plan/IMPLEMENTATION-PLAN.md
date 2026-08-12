@@ -64,7 +64,7 @@ a new DB column, and new Flutter screens on top of what MA-1 provisions.
 - `services/identity-auth/src/domain/otp_service.*` — add a `purpose` parameter (`"REGISTER" | "LOGIN"`) threaded through to the store adapter; this is additive, must not change registration's existing call sites' behavior
 - `services/identity-auth/src/adapters/otp_store_adapter.*` — add `purpose` attribute to the DynamoDB write/read; absence on old rows defaults to `"REGISTER"` per spec §7 (no backfill migration needed)
 - `services/identity-auth/src/adapters/rate_limit_adapter.*` — add a `login:otp:{mobile}` key path, distinct from MA-1's existing `register:otp:{mobile}` (MA-1's plan already named this convention specifically so this story wouldn't collide with it)
-- `services/identity-auth/src/adapters/cognito_adapter.*` — add an `InitiateAuth`-for-existing-user method and a `revokeToken(refreshToken)` method (per-device only — **must not** call `AdminUserGlobalSignOut**, per spec §6 risk note)
+- `services/identity-auth/src/adapters/cognito_adapter.*` — add an `InitiateAuth`-for-existing-user method and a `revokeToken(refreshToken)` method (per-device only — **must not** call `AdminUserGlobalSignOut`, per spec §4 FR-3)
 
 **Implementation steps:**
 
@@ -120,7 +120,8 @@ a new DB column, and new Flutter screens on top of what MA-1 provisions.
 - `lib/features/login/presentation/login_entry_screen.dart` — `/login`, standalone mobile-number entry (FR-1) — only rendered on standalone re-entry, not when arriving via MA-1's carried-forward-number redirect
 - `lib/features/login/presentation/login_otp_screen.dart` — `/login/otp` (FR-2)
 - `lib/features/login/bloc/login_events.dart` / additions to `auth_bloc.dart` — `LoginOtpRequested`, `LoginOtpVerified`, `SessionRefreshed`, `LoggedOut` events (spec §6 — these were anticipated in MA-1's `AuthBloc` design per that plan's Step 4 note, so this should be extending existing state handling, not bolting on a parallel bloc)
-- `lib/features/login/data/login_api_client.dart` — `dio` client for the 3 login endpoints + reuses MA-1's existing token-refresh call
+- `lib/features/login/data/login_api_client.dart` — `dio` client for the 3 login endpoints (Identity Auth: send/verify/logout) + reuses MA-1's existing token-refresh call
+- `lib/features/login/data/user_api_client.dart` — `dio` client for `GET /users/me` (User Service — a distinct backend from `login_api_client.dart`'s Identity Auth endpoints); called once per login to resolve `accountType`
 - `lib/core/session/session_state.dart` — `SessionState` model (spec §7), adds `accountType` on top of whatever token fields MA-1's `AuthBloc` already tracks
 
 **Files to modify:**
@@ -134,7 +135,7 @@ a new DB column, and new Flutter screens on top of what MA-1 provisions.
 1. Confirm MA-1's `signup_screen`'s existing "Log in" link contract (what route/state does it currently navigate to?) before building `/login/otp` — this determines whether `login_otp_screen` needs to accept a route parameter for the carried-forward number or whether that wiring needs a small MA-1-side fix first.
 2. Implement `login_entry_screen` (standalone re-entry path only) and `login_api_client`'s send call.
 3. Implement `login_otp_screen`: 6-digit `pinput` (per the resolved product decision — build 6 digit cells, not the 5 shown in the attached mockup, which is flagged as a stale design asset in the spec), resend countdown, lockout state.
-4. Wire OTP verify → token storage (reuse MA-1's `secure_token_storage`) → call `GET /users/me` → store `accountType` in `SessionState`.
+4. Wire OTP verify → token storage (reuse MA-1's `secure_token_storage`) → call `GET /users/me` via `user_api_client.dart` → store `accountType` in `SessionState`.
 5. Implement role-aware landing: read `SessionState.accountType`, render the B2C/B2B indicator on Home (no B2B-specific screens — just the indicator, per spec §4 FR-4's deliberately narrow scope).
 6. Implement the silent-refresh-on-app-start path if not already generic in MA-1's `AuthBloc`.
 7. Implement the logout action (placement is provisional per the spec's own open question — put it wherever the current nav shell has room; don't block this story on a real Account screen existing) → confirmation dialog → `POST /auth/logout` → clear storage regardless of API result (spec §9) → route to entry screen.
