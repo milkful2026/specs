@@ -34,7 +34,7 @@ for it. This plan treats the merged spec files as the approval gate (equivalent 
 
 ## 2. Prerequisites
 
-All four target repos (`milkful-app`, `services`, `portal-ui`) are scaffold-only — confirmed by
+All three target repos (`milkful-app`, `services`, `portal-ui`) are scaffold-only — confirmed by
 listing each: `milkful-app` has only docs/scripts (no `lib/`, no `pubspec.yaml`); `services` has
 only `README.md` (no service directories); `portal-ui` has only `README.md`. Nothing below is
 "already satisfied" — everything is a fresh build.
@@ -78,7 +78,7 @@ reading is wrong, stop before Step 3.1 below and get explicit sign-off first.
 - `services/identity-auth/src/domain/otp_service.*` — OTP generation, bcrypt hashing, expiry/attempt rules, rate-limit check (business rules only, no AWS SDK imports per §3.4/§3.7)
 - `services/identity-auth/src/domain/social_link_service.*` — idToken validation policy, existing-mobile-vs-social-only branching (FR-3, flagged G1)
 - `services/identity-auth/src/domain/exceptions.*` — typed exceptions: `OtpExpiredError`, `OtpAttemptsExceededError`, `UserExistsError`, `RateLimitExceededError`, `InvalidSocialTokenError`
-- `services/identity-auth/src/adapters/cognito_adapter.*` — wraps `AdminCreateUser`, `AdminConfirmSignUp`, `InitiateAuth`; only place allowed to import the Cognito SDK (§3.7)
+- `services/identity-auth/src/adapters/cognito_adapter.*` — wraps `AdminCreateUser`, `AdminConfirmSignUp`, `InitiateAuth`; the only place *within Identity Auth's own module* allowed to import the Cognito SDK (§3.7 is a per-service isolation rule — it does not forbid User Service from having its own narrow Cognito adapter for its own concerns, see MA-93's `cognito_attribute_adapter` below)
 - `services/identity-auth/src/adapters/otp_store_adapter.*` — DynamoDB `otp_requests` read/write
 - `services/identity-auth/src/adapters/rate_limit_adapter.*` — Redis counter, key `register:otp:{mobile}` (matches the naming convention MA-21's login spec later relies on to avoid counter collision)
 - `services/identity-auth/src/adapters/social_jwks_adapter.*` — Google/Apple JWKS validation
@@ -161,7 +161,7 @@ reading is wrong, stop before Step 3.1 below and get explicit sign-off first.
 - `services/user/src/domain/exceptions.*` — `NotServiceableError`, `ValidationError`, `DuplicateRegistrationError` (handled as idempotent 200, not a hard error — see spec §8)
 - `services/user/src/adapters/user_repository.*` — Aurora `users`/`addresses`/`user_consents` writes, single DB transaction across all three (per NFR "Consistency")
 - `services/user/src/adapters/inventory_client_adapter.*` — calls Inventory's internal serviceability endpoint (re-validation before commit, spec §8) — this is the *only* place allowed to make that outbound call, per the adapter pattern
-- `services/user/src/adapters/cognito_attribute_adapter.*` — `AdminUpdateUserAttributes` for `name`, `custom:default_pincode`
+- `services/user/src/adapters/cognito_attribute_adapter.*` — `AdminUpdateUserAttributes` for `name`, `custom:default_pincode`; User Service's own narrow, single-purpose Cognito adapter (§3.7's "only place" restriction is scoped per-service, not repo-wide — see the note on Identity Auth's `cognito_adapter` above)
 - `services/user/src/adapters/outbox_publisher.*` — transactional outbox table + a separate publisher Lambda/consumer that reads the outbox and emits `UserRegistered` to EventBridge (spec §6 "Outbox")
 - `services/user/migrations/0001_users_addresses_consents.sql` — `users`, `addresses`, `user_consents`, `outbox_events` tables per spec §6 schema
 - `services/user/Dockerfile` or Lambda packaging, per team convention (spec says Lambda)
@@ -174,7 +174,7 @@ reading is wrong, stop before Step 3.1 below and get explicit sign-off first.
 3. Implement `user_repository` with a single transaction spanning `users` insert/upsert, `addresses` insert, `user_consents` insert.
 4. Implement the outbox pattern: `outbox_events` write inside the same transaction as step 3, plus a separate publisher process that polls/streams the outbox to EventBridge — do not publish directly from inside the request-handling transaction (this is what makes the "event publish fails but user still created" edge case in spec §9 safe).
 5. Implement `inventory_client_adapter` calling Inventory's `/internal/serviceability/check` (depends on MA-95 being deployed first, per Implementation Order).
-6. Implement `registration_service`: validation rules, then orchestrate repository + inventory re-check + Cognito attribute sync, in that order (fail fast on validation before any writes).
+6. Implement `registration_service`: validation rules, then orchestrate inventory re-check + repository + Cognito attribute sync, in that order (fail fast on validation before any writes; the inventory re-check must complete and pass *before* the Aurora transaction commits, per `inventory_client_adapter`'s "re-validation before commit" contract above — a non-serviceable address must never reach the database).
 7. Implement `register_handler` (JWT `sub` extraction, DTO mapping, calls `registration_service`) and `delivery_slots_handler` (reads zone/slot config — confirm at implementation time whether this is a local replica or a live call to Inventory; the spec leaves this as "cached from Inventory or local replica" — resolve with whoever owns Inventory before hardcoding one approach).
 8. Wire idempotency: duplicate `POST /users/register` for the same `cognito_sub` returns the existing `userId` with `200`, not a `409` or duplicate row.
 
@@ -200,7 +200,7 @@ reading is wrong, stop before Step 3.1 below and get explicit sign-off first.
 - `services/wallet/src/adapters/wallet_repository.*` — Aurora `wallets`/`ledger_entries` writes
 - `services/wallet/src/adapters/wallet_event_publisher.*` — publishes `WalletCreated` to EventBridge
 - `services/wallet/migrations/0001_wallets_ledger.sql` — `wallets` (id, user_id UNIQUE, balance, currency, status, created_at), `ledger_entries` (id, wallet_id, type, amount, ref, created_at)
-- `services/wallet/Dockerfile` — Fargate consumer + a Lambda for the status/retry API (per spec §6, this spec spans two compute types — keep the consumer and the API as separate deployables, not one artifact, per "one service → one deployable artifact" *per component*, matching how Identity Auth already separates Lambda handlers from its adapters)
+- `services/wallet/Dockerfile` — Fargate consumer + a Lambda for the status/retry API (per spec §6, this spec spans two compute types — keep the consumer and the API as separate deployables, not one artifact, per "one service → one deployable artifact" *per component*; this is genuinely two artifacts, unlike Identity Auth's handlers/adapters split, which is internal code organization within a single Lambda and is not a precedent for multiple deployables)
 - `services/wallet/README.md`
 
 **Implementation steps:**
@@ -219,7 +219,7 @@ reading is wrong, stop before Step 3.1 below and get explicit sign-off first.
 - Integration: publish a `UserRegistered` event → assert a wallet row and opening ledger entry exist
 - Chaos/negative: forced DB insert failure → DLQ → status `FAILED` → manual retry restores `ACTIVE`; duplicate event delivery → no second wallet
 
-**Acceptance check:** integration suite passes; publishing a test `UserRegistered` event against a deployed dev stack results in `GET /wallet/me/status` returning `ACTIVE` within 5s.
+**Acceptance check:** integration suite passes; publishing a test `UserRegistered` event against a deployed dev stack results in `GET /wallet/me/status` returning `ACTIVE` within 45s (matching the "<30s normal" latency documented in Step 6 above, plus buffer for event/queue delivery).
 
 ---
 
@@ -252,7 +252,7 @@ reading is wrong, stop before Step 3.1 below and get explicit sign-off first.
 5. Implement social auth entry points (`social_auth_handler` calls) with the `requiresMobileVerification` branch honored.
 6. Implement `profile_screen`, `address_screen` (map + search + manual, with the location-permission-denied → manual fallback), `serviceability_widget`.
 7. Implement `slot_screen`, `consent_screen` (including the WebView legal doc links).
-8. Implement `success_screen` with the wallet-status poll (every 2s up to 15s) and retry banner.
+8. Implement `success_screen` with the wallet-status poll (every 2s up to 45s, matching Wallet's documented "<30s normal" creation latency plus buffer) and retry banner.
 9. Implement `onboarding_draft_storage` and wire save-on-Continue / resume-on-relaunch (FR-10).
 10. Wire `app_router` guards so an authenticated session skips straight past onboarding on relaunch.
 
@@ -277,7 +277,7 @@ reading is wrong, stop before Step 3.1 below and get explicit sign-off first.
 |-------|-------|
 | Unit | Per-service domain logic (see each spec section above) — no AWS SDK, no DB, no network |
 | Integration | Per-service, against a test DB / LocalStack / Cognito test pool |
-| Contract | Event payload shapes (`OtpRequested`, `UserRegistered`, `WalletCreated`) match what each consumer expects — verify against the envelope format in `services/README.md` §5 |
+| Contract | Event payload shapes (`OtpRequested`, `UserRegistered`, `WalletCreated`, `ZoneUpdated`) match what each consumer expects — verify against the envelope format in `services/README.md` §5 |
 | E2E | The single Flutter integration test scenario in the mobile spec, run against a real deployed dev stack of all four services |
 
 **How to run (per service, once scaffolded):** `{unit/integration test command per the language/framework chosen at implementation time — not yet fixed, since no service code exists to inherit a convention from}`. For Flutter: `flutter test` (widget + unit), `flutter test integration_test/` (integration).
