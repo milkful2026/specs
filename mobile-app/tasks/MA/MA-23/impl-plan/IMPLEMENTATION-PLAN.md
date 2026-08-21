@@ -38,7 +38,7 @@ which — MA-120 FR-7 and MA-121 FR-6 — turned out to assert an integration as
 | Repo/Service | Status |
 |---|---|
 | `milkful-app` (Flutter) | Real, substantially built — registration, login, and catalog browse/search are implemented and merged. **Not** scaffold-only (unlike what MA-1's own plan described as its starting point). |
-| `services/catalog` (MA-94) | Real, running code — `GET /products`, `GET /products/{id}` (`services/catalog/src/handlers/products_handler.py:21`), `GET /categories`, `GET /search` all exist today. **Missing:** the `availableQuantity` field MA-120 §7 calls for — `serialize_product` (`services/catalog/src/handlers/dto.py:16`) doesn't emit it yet. |
+| `services/catalog` (MA-94) | Real, running code — `GET /products`, `GET /products/{id}` (`services/catalog/src/handlers/products_handler.py:21`), `GET /categories`, `GET /search` all exist today. **Missing:** the `availableQuantity` field MA-120 §7 calls for — and it's not just a serializer gap: `Product` (`services/catalog/src/domain/models.py`) has no quantity-related attribute at all to emit, so this is a domain-model + data-source change, not a one-line tweak to `serialize_product` (`services/catalog/src/handlers/dto.py:16`). |
 | `services/user` (MA-93/MA-107) | Real — `GET /users/me` exists (`services/user/src/handlers/dto.py:102`, `serialize_user_profile`), returns `userId/name/mobile/accountType/defaultAddressId` only. **Missing:** any way to resolve the default address's `state` — see §2.1, a gap this plan surfaces that neither MA-120 nor MA-121's own review passes caught. |
 | `services/cart` (MA-96) | **Does not exist.** Spec merged (PR #8, reviewed) but no directory under `services/`. |
 | `services/pricing-offer` (MA-101) | **Does not exist.** Spec merged (PR #9, reviewed) but no directory under `services/`. |
@@ -58,18 +58,21 @@ turns out not to be true of the actual code: `address_screen.dart` submits an `A
 (carrying `state`) into `RegistrationBloc` and never retains it anywhere retrievable afterward — no
 field on `UserProfile` (`lib/features/auth/models/user_profile.dart`), `AuthBloc`, or any local
 storage holds the customer's address `state` post-registration. `GET /users/me`'s response
-(`services/user/src/handlers/dto.py:102`) returns `defaultAddressId` only, not the address body,
-even though the backend's own `UserProfile` domain object already carries the full `Address` list
-(`services/user/src/domain/models.py`) — the data exists server-side, it's just never serialized
-out.
+(`services/user/src/handlers/dto.py:102`) returns `defaultAddressId` only, not the address body —
+and the gap isn't just the serializer: the backend's own `UserProfile` domain object
+(`services/user/src/domain/models.py`) doesn't carry it either, only `default_address_id: str`. The
+data *is* already fetched server-side, though — `get_profile_by_sub`
+(`services/user/src/adapters/user_repository.py`) reads the default address row via
+`_fetch_user_with_default_address` on every call, then discards everything except its `id` when
+building `UserProfile`. So the state is one field-through away, not a new query.
 
 **Resolution (small, additive, same category as this SDD chain's other flagged contract
-additions):** `serialize_user_profile` gains a `defaultAddressState` field, resolved by matching
-`default_address_id` against `profile.addresses` (`None` if no default address is set — mirrors the
+additions):** `UserProfile` gains a `default_address_state` field, populated from the address row
+`get_profile_by_sub` already fetches (`None` if no default address is set — mirrors the
 `DELIVERY_ADDRESS_REQUIRED` case MA-121 §9 already anticipates for Cart Service's own resolution
-path). The mobile `UserProfile` model gains the matching nullable field. This must land before
-`ProductConfigBloc` can call `PricingRepository.quote(...)` with a real state value instead of a
-placeholder — see §4A/§4D.
+path); `serialize_user_profile` then emits it as `defaultAddressState`. The mobile `UserProfile`
+model gains the matching nullable field. This must land before `ProductConfigBloc` can call
+`PricingRepository.quote(...)` with a real state value instead of a placeholder — see §4A/§4D.
 
 ## 3. Implementation Order
 
@@ -90,21 +93,34 @@ placeholder — see §4A/§4D.
 
 ### §4A: `services/user` — `defaultAddressState`
 
+`UserProfile` (`services/user/src/domain/models.py`) has no `addresses` field to search — only
+`default_address_id: str`. `SqlAlchemyUserRepository.get_profile_by_sub`
+(`services/user/src/adapters/user_repository.py`) already fetches the default address row (via the
+shared `_fetch_user_with_default_address` helper) but currently discards everything except
+`default_row.id` when building `UserProfile`. This *is* a domain-model change, not just a
+serializer tweak.
+
 **Files to modify:**
-- `services/user/src/handlers/dto.py` — `serialize_user_profile` resolves and adds
-  `defaultAddressState`.
+- `services/user/src/domain/models.py` — add `default_address_state: str | None = None` to
+  `UserProfile`.
+- `services/user/src/adapters/user_repository.py` — `get_profile_by_sub` passes
+  `default_address_state=default_row.state if default_row else None` when constructing
+  `UserProfile` (the row is already in scope; no new query).
+- `services/user/src/handlers/dto.py` — `serialize_user_profile` adds
+  `"defaultAddressState": profile.default_address_state` to the returned dict.
 
 **Implementation steps:**
-1. In `serialize_user_profile`, find the `Address` in `profile.addresses` whose id matches
-   `profile.default_address_id`; add `"defaultAddressState": match.state if match else None` to the
-   returned dict.
-2. No domain/model change needed — `Address.state` already exists
-   (`services/user/src/domain/models.py:10`).
+1. Add the `default_address_state` field to the `UserProfile` dataclass.
+2. In `get_profile_by_sub`, thread `default_row.state` (already fetched) through to the new field —
+   `None` when the user has no default address, same as `default_address_id`'s own `""` fallback
+   pattern there.
+3. In `serialize_user_profile`, emit `defaultAddressState` from `profile.default_address_state`.
 
 **Tests to write:**
-- Unit: `serialize_user_profile` with a matching default address (returns its `state`), with no
-  default address set (returns `None`), with a `default_address_id` that doesn't match any address
-  in the list (defensive — returns `None`, doesn't raise).
+- Unit: `get_profile_by_sub` returns `default_address_state` set from the default address row when
+  one exists, and `None` when the user has no default address (`default_row is None`).
+- Unit: `serialize_user_profile` emits `defaultAddressState` straight from `profile.default_address_state`
+  (both the populated and `None` cases).
 - Regression: existing `GET /users/me` integration test still passes with the new field present.
 
 **Acceptance check:** `pytest services/user/tests/` passes.
@@ -204,11 +220,17 @@ is a separate, small PR to that service — until it lands, every `Product` this
     required int quantity,
     required Frequency frequency,
     DateTime? startDate,
+    required String idempotencyKey,
   });
   ```
-  `DioCartRepository` posts to `{cartBaseUrl}/cart/items` with an `Idempotency-Key` header — one
-  `newHexId()` (§4B) generated when the confirm attempt starts and reused across any retry of that
-  same attempt (MA-121 FR-8's contract), not regenerated per HTTP call.
+  `idempotencyKey` is a required parameter, not something `DioCartRepository` mints itself — the
+  caller (`ProductConfigBloc`, §4E) generates one `newHexId()` (§4B) when the confirm attempt
+  starts and passes the *same* value into every retry of that attempt (MA-121 FR-8's contract).
+  Minting the key inside `DioCartRepository` instead would defeat retry-dedup: a timeout followed
+  by a bloc-level retry would send two different keys for what's meant to be one logical attempt,
+  creating a duplicate cart item. `DioCartRepository` posts to `{cartBaseUrl}/cart/items` with
+  `idempotencyKey` as the `Idempotency-Key` header value — it doesn't generate or cache anything
+  itself.
 - `test/fakes/fake_pricing_repository.dart`, `test/fakes/fake_cart_repository.dart` — configurable
   success/failure fakes, matching `fake_catalog_repository.dart`'s existing shape.
 - `lib/core/config/app_config.dart` — add `cartBaseUrl` (`CART_BASE_URL`, default
@@ -230,7 +252,9 @@ is a separate, small PR to that service — until it lands, every `Product` this
 1. `Frequency` enum + wire mapping first — everything else depends on it.
 2. `Quote` model.
 3. `PricingRepository` (abstract + Dio + fake) — includes the `DELIVERY_STATE_UNKNOWN` fail-fast.
-4. `CartRepository` (abstract + Dio + fake) — includes Idempotency-Key generation/reuse.
+4. `CartRepository` (abstract + Dio + fake) — `addItem` takes `idempotencyKey` as a required
+   parameter and forwards it as the `Idempotency-Key` header; generating/reusing that key across
+   retries is the caller's job (`ProductConfigBloc`, §4E), not this repository's.
 5. `WalletBalanceRepository` (abstract + fake only).
 6. `AppConfig` additions.
 
@@ -253,7 +277,8 @@ exists to integration-test against, see §2).
 
 **Files to create:**
 - `lib/features/cart/bloc/product_config_event.dart` — `ProductConfigStarted`,
-  `FrequencyChanged`, `StartDateChanged`, `QuantityChanged`, `AddToCartRequested`.
+  `FrequencyChanged`, `StartDateChanged`, `QuantityChanged`, an internal `QuoteRequested`,
+  `AddToCartRequested`.
 - `lib/features/cart/bloc/product_config_state.dart` — phase-based, mirroring
   `RegistrationState`'s shape (`product`, `selection` (frequency/date/quantity), `quote`
   (idle/loading/loaded/error), `walletCheck` (idle/loading/sufficient/insufficient/error),
@@ -264,13 +289,17 @@ exists to integration-test against, see §2).
 1. `ProductConfigStarted`: seeds state from the `Product` passed via route `extra:` (MA-120 §6),
    then kicks off the stale-stock re-fetch (`CatalogRepository.getProduct`, §4C) and the wallet
    balance read (`WalletBalanceRepository`, §4D) in parallel — neither blocks initial render.
-2. `FrequencyChanged`/`QuantityChanged`/`StartDateChanged`: update selection, then re-issue a quote
-   request. Register these three (or a shared internal `_QuoteRequested` they all funnel into) with
-   **`transformer: restartable()`** from `bloc_concurrency` — this is `CatalogBloc`'s own established
-   pattern (`lib/features/catalog/bloc/catalog_bloc.dart:14-26`) for exactly this problem (a rapid
-   sequence of user-driven events where only the latest matters): it cancels any in-flight quote
-   handler when a newer one starts, which solves both FR-5's debounce-adjacent need and the
-   out-of-order-response risk the PR #7 review flagged, without a hand-rolled sequence number.
+2. `FrequencyChanged`/`QuantityChanged`/`StartDateChanged`: update selection, then each `add`s the
+   same internal `QuoteRequested` event rather than issuing its own quote fetch. **Only
+   `QuoteRequested` is registered with `transformer: restartable()`** from `bloc_concurrency` —
+   `CatalogBloc`'s own `restartable()` usage (`lib/features/catalog/bloc/catalog_bloc.dart:14-26`)
+   only ever cancels races *within one event type* (e.g. `SearchQueryChanged` against
+   `SearchQueryChanged`), which is exactly why the three selection-changing events must not each
+   register their own `restartable()` handler: doing so cancels same-type races but not
+   cross-type ones, so a slow `FrequencyChanged`-triggered quote could still land after and
+   overwrite a newer `QuantityChanged`-triggered one. Funneling all three into one `QuoteRequested`
+   stream is what actually closes that race — this is the PR #7-flagged out-of-order-response risk
+   and MA-120 FR-5's requirement, solved without a hand-rolled sequence number.
 3. Debounce (300ms) belongs in the **screen's** `Timer`, not the bloc — matches
    `catalog_page.dart`'s `_onSearchChanged` pattern (`Timer` in the `StatefulWidget`, dispatching the
    bloc event after the delay) rather than the bloc debouncing its own input.
@@ -278,10 +307,12 @@ exists to integration-test against, see §2).
    (FR-7), then calls `CartRepository.addItem`.
 
 **Tests to write:**
-- Unit (`bloc_test`): each event's state transitions; `restartable()` behavior — a `QuantityChanged`
-  fired while a prior quote is in flight cancels the prior handler (assert only the latest quote
-  result lands in state); wallet gate blocks `AddToCartRequested` for subscription frequencies with
-  insufficient balance but not for one-time; add success/failure paths.
+- Unit (`bloc_test`): each event's state transitions; `restartable()` behavior — specifically a
+  **`FrequencyChanged` fired while its resulting quote is still in flight, immediately followed by
+  a `QuantityChanged`**, asserting only the `QuantityChanged`-triggered quote result lands in
+  state (the actual cross-event race this design has to close, not just two same-type events);
+  wallet gate blocks `AddToCartRequested` for subscription frequencies with insufficient balance
+  but not for one-time; add success/failure paths.
 
 **Acceptance check:** `flutter test test/features/cart/bloc/` passes.
 
