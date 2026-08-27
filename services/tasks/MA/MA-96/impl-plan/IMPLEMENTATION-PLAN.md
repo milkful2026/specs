@@ -23,6 +23,26 @@ Service (MA-100), which are not.
 this plan lives at `services/tasks/MA/MA-96/impl-plan/`, alongside the spec it implements, mirroring
 MA-23's own impl plan (`mobile-app/tasks/MA/MA-23/impl-plan/`).
 
+## 1a. Status Update (2026-08-27) — code review findings, resolved vs. still open
+
+This repo's own PR #11 (2026-08-21) review found six issues in this plan/its early
+implementation. Re-checked against the real code today, not just this document:
+
+| Finding | Status |
+|---|---|
+| §4A's internal endpoint would ship public and unauthenticated ("network isolation" doesn't exist for a Lambda + HttpApi service, unlike Inventory's Fargate-behind-private-ALB setup this plan borrowed the reasoning from) | **Fixed.** The route now uses `HttpIamAuthorizer` (AWS_IAM/SigV4) in `user_stack.py`, verified via `cdk synth` — the route synthesizes with `AuthorizationType: AWS_IAM`, not `JWT`, not unauthenticated. `internal_caller_role_arns` (defaults to empty — nobody granted yet) is where Cart Service's own execution role ARN gets added once its CDK stack exists; the route's `execute-api` ARN is exported via `CfnOutput` for that stack to import. §4A below is updated to match — do not reintroduce the old "network isolation" framing. |
+| §4A claimed no `UserProfile` field/repository change was needed for `default_address_state`, but at the time neither the field nor the repository population existed | **Fixed** (as a side effect of unrelated work, `services/user` PR #10's first commit) — `default_address_state` is now genuinely on `UserProfile`, populated in `user_repository.py`, and serialized on `GET /users/me`. §4A's original claim is accurate now, not just asserted. |
+| §4A didn't mention that `get_my_profile` raises `UserNotFoundError` rather than returning `None`, so the handler would 500 instead of returning `{"defaultAddressState": null}` | **Fixed** — the actual handler (`internal_address_state_handler.py`) catches `UserServiceError` broadly and maps it to the correct HTTP status (404 for `UserNotFoundError`), covered by its own test suite. |
+| §6 of the merged MA-121 spec explicitly says "a small, additive consumer of an existing capability, not a new endpoint on `user`'s side," but this plan adds a new endpoint anyway, without reconciling the contradiction | **Still open.** This plan still adds a new endpoint (§4A) — that's the correct call given `get_my_profile`'s actual signature (it needs `cognito_sub`, which `user`'s existing public routes resolve from the caller's own JWT, not an arbitrary target user), but MA-121 §8 itself hasn't been revised to match. Whoever owns MA-121 should reconcile the spec text with what's actually being built, not this plan silently overriding the spec. |
+| MA-121 §6/§11's Redis read-through cache (flagged as needing Platform/Architecture sign-off before implementation) is absent from this plan with no acknowledgment | **Still open.** `grep -i redis` over this entire plan still returns nothing. Not implemented, not deferred-with-a-note, not sign-off-requested — just silently absent, same as PR #11 found it. If Redis is out of scope for this pass, that should be a stated decision here, not silence. |
+| §4D's DynamoDB schema gives `ITEM#`/`IDEMPOTENCY#` rows a TTL but the `META` row (holding `cartVersion`) has none, so `cartVersion` could persist at a stale non-zero value after every item has expired | **Still open.** §4D below is unchanged — `META`'s `cartVersion` still has no TTL or reset policy. FR-1's "no cart and empty cart are the same state" implies `cartVersion` should read `0` once items expire; nothing here makes that true. |
+
+**Net: the one finding that actually blocked shipping (the auth gap) is fixed and verified. Of the
+other five, two are genuinely resolved (the `UserProfile` field, the missing-user handling); three
+— the MA-121 §8 contradiction, the silently-dropped Redis cache, and the `cartVersion` TTL gap —
+are still exactly where the review left them and need real decisions, not just
+re-acknowledgment.**
+
 ## 2. Prerequisites
 
 Confirmed by reading each target service directly — **three of MA-121's own dependency assumptions
@@ -101,28 +121,52 @@ flagged contract additions):**
 
 ### §4A: `services/user` — internal address-state endpoint
 
-**Files to create:**
+**Status: implemented and fixed** — see §1a. This section is updated to describe what's actually
+built, not the original (unauthenticated) design.
+
+**Files created:**
 - `services/user/src/handlers/internal_address_state_handler.py` —
-  `GET /v1/internal/users/{cognitoSub}/address-state`, **not** JWT-authenticated the way `/users/me`
-  is (this is a service-to-service call inside the VPC, matching Inventory's own internal-endpoint
-  precedent — no API Gateway Cognito authorizer on this route). Calls the existing
-  `RegistrationService.get_my_profile(cognito_sub)` domain method unchanged — this is a new
-  transport onto existing domain logic, not new domain logic.
+  `GET /v1/internal/users/address-state?cognitoSub=` (query parameter — matches Inventory's own
+  internal-endpoint convention, `?pincode=&lat=&lng=`, not a path parameter as originally drafted
+  here). **Not** JWT-authenticated the way `/users/me` is — but also **not** relying on "network
+  isolation" as originally planned, since that reasoning doesn't hold for a Lambda + HttpApi service
+  (see §1a). Calls the existing `RegistrationService.get_my_profile(cognito_sub)` domain method
+  unchanged, and catches `UserServiceError` broadly so a missing user maps to 404 rather than 500.
 - Response: `{"defaultAddressState": "Karnataka" | null}` — deliberately narrower than
   `GET /users/me`'s full profile (§11 of MA-93's own spec already establishes "keep this minimal");
   Cart Service has no legitimate need for the caller's name/mobile/accountType.
 
-**Implementation steps:**
-1. Add the handler, reusing `get_my_profile` — no new repository method needed (`default_address_state`
-   already flows through `UserProfile` from MA-23's own §4A work).
-2. Wire the route in `services/user`'s API Gateway/CDK stack (internal-only — no Cognito authorizer
-   attached, network-isolation is the boundary, matching Inventory's own internal route).
-3. Add to `services/local-dev/_lambda_local_server.py`'s route table via `user/run_local.py`.
+**Real auth mechanism (`user_stack.py`):**
+1. The route is registered with `apigwv2_authorizers.HttpIamAuthorizer()` — AWS_IAM/SigV4
+   authorization, the same category of protection the JWT authorizer gives every public route here,
+   just for a service-to-service caller instead of an end user. Verified via `cdk synth`: the route
+   synthesizes with `AuthorizationType: AWS_IAM`.
+2. `UserStack` takes a new `internal_caller_role_arns: tuple[str, ...] = ()` constructor argument.
+   For each ARN, the stack imports that role (`iam.Role.from_role_arn(..., mutable=True)`) and
+   attaches an `execute-api:Invoke` policy scoped to this route's exact ARN. Defaults to empty —
+   **nobody is granted access until a real caller's role ARN is added.**
+3. The route's `execute-api` ARN is also exported via `CfnOutput` (`InternalAddressStateRouteArn`),
+   so a caller's own stack can instead grant itself directly once it exists, without `user_stack.py`
+   needing to know about it in advance.
+4. **Cart Service's own execution role doesn't exist yet** (MA-96 itself isn't built) — so today,
+   `internal_caller_role_arns` has nothing real to reference. This route is deployed but
+   unreachable by design until that changes. Whoever builds Cart's own CDK stack (§4H) must either
+   pass its execution role's ARN into `UserStack`, or use the exported output to grant itself —
+   this plan's own §4H doesn't do that yet (Cart's stack isn't built), so it's a real follow-up, not
+   assumed-done here.
+5. Local dev: `services/local-dev/_lambda_local_server.py` doesn't emulate IAM/SigV4 at all (same
+   as it doesn't verify the Cognito JWT authorizer's signature on public routes) — the route is
+   reachable directly from `localhost:8002` in local dev regardless of the real IAM restriction.
+   This is an accepted, documented gap in the local-dev shim generally, not specific to this route.
 
-**Tests to write:** unit test mirroring `test_get_me_handler.py`'s shape, minus the JWT-claims
-plumbing (no claims to extract — the path parameter is the identifier).
+**Tests written:** `services/user/tests/unit/handlers/test_internal_address_state_handler.py`
+(handler-level, mirroring `test_get_me_handler.py`'s shape) and 5 new tests in
+`services/user/tests/infra/test_user_stack.py` asserting the route's `AuthorizationType` is
+`AWS_IAM` (not JWT, not absent), that `internal_caller_role_arns` produces the expected
+`execute-api:Invoke` policy on the given role, and that the default (empty) case grants nobody.
 
-**Acceptance check:** `pytest services/user/tests/` passes (regression + new tests).
+**Acceptance check:** `pytest services/user/tests/` passes — 104 tests, including the 5 new infra
+tests (all passing as of 2026-08-27).
 
 ---
 
@@ -352,3 +396,20 @@ One commit per lettered step in §4, in order — mirrors the MA-23 impl plan's 
   service — per services/README.md §3's "extending an existing service does not require a new-service
   gate but does require reporting what is added and why" — reported here, not requiring the
   new-service architect gate.
+- ~~**§4A's internal endpoint had no real auth**~~ — **Fixed 2026-08-27**, see §1a/§4A:
+  `HttpIamAuthorizer` + `internal_caller_role_arns`, verified via `cdk synth`. Still requires a
+  human to wire Cart Service's real execution role ARN in once its own CDK stack (§4H) exists — the
+  route is deployed but deliberately unreachable until then.
+- **MA-121 §8 still says this should be "not a new endpoint on `user`'s side," contradicting §4A as
+  actually built.** Not a code problem — `get_my_profile` needs a target `cognito_sub` that a
+  reused public route has no way to accept safely — but the spec text itself needs a reviewer to
+  reconcile it, not another plan to silently route around it.
+- **Redis read-through cache (MA-121 §6/§11) is still completely absent from this plan**, with no
+  implementation, no explicit deferral, and no sign-off request — exactly as PR #11's review found
+  it. Needs an explicit decision (build it with sign-off, or formally defer it) before this story is
+  considered complete against its own spec.
+- **`cartVersion`'s `META` row still has no TTL/reset policy** (§4D) — line items and idempotency
+  records expire; the version counter doesn't, so a cart that's fully expired could still report a
+  stale non-zero `cartVersion`, inconsistent with FR-1's "no cart and empty cart are the same state."
+  Needs a concrete fix (TTL on `META` too, or an explicit reconciliation rule), not just
+  re-acknowledgment.
