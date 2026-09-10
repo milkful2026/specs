@@ -66,13 +66,30 @@
 
 ---
 
+## Review round 2 — external `/code-review` on PR #16 (2026-09-11)
+
+Ten correctness findings were raised on the PR and addressed by revising the specs on `spec/MA-24`:
+
+| # | File | Finding | Resolution |
+|---|------|---------|------------|
+| 1 | MA-126 §FR-1 | "return the stored create-response verbatim" contradicted the gateway-outage retry (row with no `razorpay_order_id`) | FR-1 idempotency now branches: order present → verbatim; order absent → resume `orders.create` once. |
+| 2 | MA-127 §7 | migration ran `ALTER COLUMN ref SET NOT NULL` before the opening-`ref` backfill → abort on MA-1 rows | Backfill `UPDATE` reordered **before** `SET NOT NULL` / `ADD UNIQUE`. |
+| 3 | MA-125 §FR-6/§6 | client `confirmRecharge` dropped `razorpayOrderId`, which MA-126 FR-2 requires (409 `ORDER_MISMATCH`) | `razorpayOrderId` added to `RechargeGatewaySucceeded`, `confirmRecharge(...)`, and the tests. |
+| 4 | MA-125 §FR-6 | pending-poll had no `getPayment()` = `FAILED` branch → failed payment shown as "updating shortly" | Added a `FAILED` → failure-state (FR-8) branch; §9 + tests updated. |
+| 5 | MA-125 §6/§FR-3 | `idempotencyKey` not cleared after a pending-timeout → new amount charged at the old amount | Key persisted per attempt and reused; amount controls disabled while an attempt is unresolved; key cleared only on a terminal outcome. |
+| 6 | MA-125 §FR-2/§7 | memory-only idempotency key → app-kill-after-pay allowed a second charge | New `wallet.pendingRecharge` `shared_preferences` record; `WalletStarted` resumes the *same* payment (FR-6a). |
+| 7 | MA-126 §FR-5/§9 | 30-min reconciliation force-FAILED a still-open UPI collect; a late capture went to manual review | Sweep no longer force-fails while Razorpay shows the order payable (6-h hard cap); `TIMEOUT` is provisional and a late `captured` auto-recovers to `CONFIRMED` (`LATE_CAPTURE_RECOVERED`). |
+| 8 | MA-126 §FR-1 | idempotency dedupe ignored `amountPaise`/`purpose` → reused key + new amount returned the wrong order | Body-mismatch on a reused key → 409 `IDEMPOTENCY_KEY_REUSED`. |
+| 9 | MA-127 §FR-1/§FR-7 | `/wallet/me/status` "alias" returning the new `balancePaise` body would break MA-1's rupee consumer | `/wallet/me/status` explicitly keeps MA-1's original `{…, balance (rupees), currency}` body; `GET /wallet/me` is a new endpoint; MA-1 screen migration is out of scope. |
+| 10 | MA-125 §FR-6/§FR-7 | success inferred from a `getWallet()` balance delta → false-positive on a concurrent same-value credit | Success is decided **only** by `getPayment(paymentId)` = `CONFIRMED`; `getWallet()` is display-only. |
+
 ## Verdict
 
-**PASS** — all individual-quality checks and all cross-specification coherence checks are satisfied for the three specs.
+**PASS (with round-2 revisions applied)** — all individual-quality and cross-specification coherence checks are satisfied; the ten correctness findings from the PR #16 `/code-review` were resolved on `spec/MA-24` (table above) without changing the specs' scope or the cross-service contract.
 
 ### Decision records / follow-up actions (carried, not blocking)
 
 1. **Architect ack required** to update `milkful-well-architected.md` §7.1 (add `WalletCredited` / `WalletDebited` to Wallet's published events) and to add the recharge `PaymentConfirmed → wallet-events-q` path to `milkful-messaging.drawio`. Raised as an acceptance item in MA-126 §8.5 / §13 and MA-127 §13. The specs adopt the fuller vocabulary regardless.
-2. **`GET /wallet/me/status` (MA-1)** kept as an alias of `GET /wallet/me` — MA-127 §12; non-breaking.
+2. **`GET /wallet/me/status` (MA-1)** kept returning MA-1's **original** body (`balance` in whole rupees) for backward-compat — it is *not* re-pointed at the new `balancePaise` FR-1 shape. Migrating MA-1's registration screen onto `GET /wallet/me` is a separate MA-1 follow-up. (MA-127 FR-1 / §12.)
 3. **`MA-33` (NR : Wallet Recharge)** overlaps MA-24; recommend closing as duplicate or repurposing for deferred extras (recharge offers/cashback, low-balance auto-recharge). Flagged on MA-24's decomposition comment.
 4. **Backend unimplemented** — MA-126 + MA-127 are first scaffolds; MA-125 ships behind a flag. Implementation-plan step to own the sequencing.
