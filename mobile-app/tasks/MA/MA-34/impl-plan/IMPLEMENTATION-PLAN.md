@@ -7,7 +7,7 @@
 | **Story** | [MA-34](https://milkfuldairyindia.atlassian.net/browse/MA-34) — Order Confirmation / Preview · Checkout (Flutter) |
 | **Date** | 2026-09-25 |
 | **Specs implemented** | [MA-135](https://milkfuldairyindia.atlassian.net/browse/MA-135) — Cart & User Service: Checkout Support (`services`) · [MA-136](https://milkfuldairyindia.atlassian.net/browse/MA-136) — Order Service: Cart Checkout (`services`) · [MA-137](https://milkfuldairyindia.atlassian.net/browse/MA-137) — Flutter Review Cart & Confirm Order (`mobile-app`) |
-| **Spec branch** | `spec/MA-34` ([specs#21](https://github.com/milkful2026/specs/pull/21), in review) |
+| **Spec branch** | `spec/MA-34` ([specs#21](https://github.com/milkful2026/specs/pull/21), in review). The plan follows the specs **after** the PR #21 review revision (commit `f5bcd93`: MA-136 FR-2a, `CHARGING` step, per-line FR-3.3, zero-amount orders, `balance_after_paise`, `linesChangedDuringCheckout`; MA-137 pending key + body, cart lock) |
 | **Repos touched** | `milkful2026/services` (cart, user, order, subscription, shared/events, local-dev), `milkful2026/milkful-app` |
 | **Code branches** | `services`: `feat/MA-34-cart-checkout` · `milkful-app`: `feat/MA-34-review-cart-checkout` (separate git worktree, see §8) |
 
@@ -17,7 +17,7 @@
 
 1. **Cart's wallet gate is a permanent stub.** `cart/src/adapters/wallet_client_adapter.py` always raises `WalletCheckUnavailableError` (written before Wallet existed), so today every subscription line added to the cart fails. That is why MA-133 routed subscriptions around the cart. PO-4 can't work without a real client. **Added to MA-135:** `HttpWalletClient.get_balance` calls Wallet's existing `GET /wallet/internal/balance?userId=` (MA-130 FR-3, VPC-only, unauthenticated, the same convention Order's wallet adapter uses).
 2. **The app sends `startDate` as a full ISO timestamp** (`DateTime.toIso8601String()` → `2026-09-27T00:00:00.000`), and Cart stores the string verbatim. Order's checkout takes the leading `YYYY-MM-DD` as the subscription start date. The app is also changed to send the date only, and the Order-side parse stays tolerant of existing lines.
-3. **`AuthBloc` state doesn't carry the profile** (`AuthAuthenticated` holds only `accountType`/`name`). MA-137 FR-6 said "read from AuthBloc, re-fetch if missing". The established pattern (`ProductConfigBloc._resolveDeliveryState`) is to call `ProfileRepository.getMe()` directly, and `CartBloc` will do the same. That call also supplies `userId` for the pending-key scope (MA-137 FR-9).
+3. **`AuthBloc` state doesn't carry the profile** (`AuthAuthenticated` holds only `accountType`/`name`). MA-137 FR-6 said "read from AuthBloc, re-fetch if missing". The established pattern (`ProductConfigBloc._resolveDeliveryState`) is to call `ProfileRepository.getMe()` directly, and `CartBloc` will do the same **for the address only**. The pending-key scope (MA-137 FR-9) must not depend on that network call. If it did, a failed profile read would lose the persisted key and turn a resume into a fresh checkout. Instead, the scope comes from the Cognito `sub` claim of the access token already in `SecureTokenStorage` (decoded locally, no signature check needed, no network). If no token is readable, the user is signed out and Confirm is disabled.
 4. **`ApiException` has no `details`.** The backend error envelope spreads details into `data` (`shared/handlers/dto.py:error_envelope`), but the app's `ApiClient._mapError` drops them. MA-137 needs `shortfallPaise` and `lines`, so `ApiException` gains an optional `details` map (additive).
 5. **Uncommitted, unrelated work exists in `milkful-app`'s `main` working tree** (the `AuthNeedsRegistration` flow and a `ProductConfig` retry rework, 12 files). MA-137 is built in a separate worktree from committed `main` so that work is untouched. See §8 for the merge overlap in `product_config_bloc.dart` / `product_config_screen.dart`.
 
@@ -26,8 +26,8 @@
 | Prerequisite | Status | Action |
 |--------------|--------|--------|
 | Order/User/Subscription test venvs | Done during analysis (`.venv` per service, already gitignored per service) | — |
-| `CART_WALLET_INTERNAL_BASE_URL` | Setting exists (`""` default), **not written** by local-dev | `local-dev/bootstrap.py`: write `WALLET_HTTP_URL` |
-| `ORDER_CART_INTERNAL_BASE_URL`, `ORDER_SUBSCRIPTION_INTERNAL_BASE_URL`, `ORDER_CHECKOUT_CUTOFF_HOUR_IST`, `ORDER_SUBSCRIPTION_MIN_BALANCE_PAISE` | Not done | Add to `order/src/config/env.py`; write the two URLs in `bootstrap.py` (`LOCAL_DEV_CART_HTTP_URL` default `http://localhost:8004`, `LOCAL_DEV_SUBSCRIPTION_HTTP_URL` default `http://localhost:8008`), set both in `docker-compose.yml`'s bootstrap environment |
+| `CART_WALLET_INTERNAL_BASE_URL` | Setting exists (`""` default). **Not written** by local-dev **nor by `cart_stack.py`**, and the new client fails closed when it's empty | `local-dev/bootstrap.py`: write `WALLET_HTTP_URL`. `cart/infra/cart/cart_stack.py`: new `wallet_internal_base_url` constructor parameter (same `PLACEHOLDER` default pattern as catalog/user/pricing) → `env_vars["CART_WALLET_INTERNAL_BASE_URL"]`, passed from the CDK app entry point wherever the other three internal URLs come from. Assert it in `test_cart_stack.py` |
+| `ORDER_CART_INTERNAL_BASE_URL`, `ORDER_SUBSCRIPTION_INTERNAL_BASE_URL`, `ORDER_CHECKOUT_CUTOFF_HOUR_IST`, `ORDER_SUBSCRIPTION_MIN_BALANCE_PAISE`, `ORDER_CHECKOUT_BUSY_SECONDS` | Not done | Add to `order/src/config/env.py`; write the two URLs in `bootstrap.py` (`LOCAL_DEV_CART_HTTP_URL` default `http://localhost:8004`, `LOCAL_DEV_SUBSCRIPTION_HTTP_URL` default `http://localhost:8008`), set both in `docker-compose.yml`'s bootstrap environment |
 | Order compose `depends_on` cart + subscription | Not done | `docker-compose.yml` |
 | Migration runner handles `0002_*.sql` | Already satisfied (`apply_migrations.py` applies sorted `*.sql`, tracked in `schema_migrations`) | — |
 | New Python / Dart packages | None needed (`requests`, `boto3`, `shared_preferences` already present) | Verify `shared_preferences` in `pubspec.yaml`; add only if missing |
@@ -56,7 +56,7 @@
 - `cart/src/handlers/add_item_handler.py`, `put_cart_handler.py`: pass `slot_id`.
 - `cart/src/handlers/composition.py`: `HttpWalletClient(settings.wallet_internal_base_url, settings.request_timeout_seconds)`.
 - `cart/run_local.py`: register the two internal routes.
-- `cart/infra/cart/cart_stack.py`: two new Lambda functions and routes under `/cart/internal/users/{userId}` and `/cart/internal/users/{userId}/remove-items` with `HttpIamAuthorizer()`, plus an `InternalRoutesArn` `CfnOutput`, mirroring `user_stack.py`'s internal route and `_grant_internal_callers`.
+- `cart/infra/cart/cart_stack.py`: two new Lambda functions and routes under `/cart/internal/users/{userId}` and `/cart/internal/users/{userId}/remove-items` with `HttpIamAuthorizer()`, plus an `InternalRoutesArn` `CfnOutput`, mirroring `user_stack.py`'s internal route and `_grant_internal_callers`. It also sets `CART_WALLET_INTERNAL_BASE_URL` from a new `wallet_internal_base_url` parameter (§2). Without it, every deployed subscription add fails closed.
 - `cart/README.md`: endpoints table and Known Gaps (the wallet gap is closed).
 
 **Files to create (cart):**
@@ -76,7 +76,7 @@
 - Unit (`cart/tests/unit/domain`): slot validation matrix; `get_cart` partition cases (one-time only, subscription only, mixed, empty) asserting pricing calls and which quote is `None`; the wallet gate in paise.
 - Unit (`cart/tests/unit/adapters`): repository `slotId` round-trip; `remove_items` match / mismatch (409) / replay-after-success / partial-present; outbox payload has `reason: CHECKOUT` and `checkoutId`. Wallet client: 200 → paise, 5xx → retry → `WalletCheckUnavailableError`, empty base URL → raises.
 - Handler tests for both internal handlers (path param, DTO validation, 409).
-- Infra test: both internal routes use the IAM authorizer (extend `test_cart_stack.py`; update "five lambdas" / "all four routes use JWT" to the new counts, with public routes still JWT).
+- Infra test: both internal routes use the IAM authorizer (extend `test_cart_stack.py`; update "five lambdas" / "all four routes use JWT" to the new counts, with public routes still JWT). Every Lambda's environment has a non-empty `CART_WALLET_INTERNAL_BASE_URL`.
 - User: `get_me` returns `defaultAddress` fully populated, `landmark: null`, and `null` when there's no default address; the flat fields are unchanged.
 
 **Acceptance check:** `cd cart && .venv/Scripts/python -m pytest -q` and `cd user && .venv/Scripts/python -m pytest -q` both green; `ruff check` clean in both.
@@ -85,24 +85,49 @@
 
 **Subscription (first):**
 - Modify `subscription/src/handlers/dto.py`: `InternalCreateSubscriptionRequest(CreateSubscriptionRequest)` + `userId: str`, `correlationId: str | None`.
-- Modify `subscription/src/handlers/internal_run_daily_handler.py` (the existing VPC-only internal router): add `POST /subscriptions/internal/create` → `SubscriptionService.create(...)` with the body's `userId`. It returns the same `success_envelope` shape as the public create, with status 201 to match the public route (check the public handler and mirror its status).
-- Test: `subscription/tests/integration/test_internal_create.py`: same body as public create for identical input; idempotent on key; 422 for an ineligible product; no JWT required.
+- Modify `subscription/src/handlers/internal_run_daily_handler.py` (the existing VPC-only internal router): add **`POST /internal/subscriptions`** (MA-136 FR-11; every internal route stays under `/internal/*` like `/internal/run-daily`, which is what keeps it off the public API Gateway) → `SubscriptionService.create(...)` with the body's `userId`. It returns the same `success_envelope` shape as the public create, with status 201 to match the public route (check the public handler and mirror its status). Its error codes and statuses are identical to the public route (`INVALID_SCHEDULE` stays a 400).
+- Test: `subscription/tests/integration/test_internal_create.py`: same body as public create for identical input; idempotent on key; 422 for an ineligible product; 400 `INVALID_SCHEDULE`; no JWT required; the route is not reachable under the public JWT API prefix.
 
 **Order files to create:**
-- `order/migrations/0002_checkout.sql`: exactly MA-136 §7 (Postgres). Use `ALTER TABLE ... ALTER COLUMN ... DROP NOT NULL`, `ADD COLUMN source ... DEFAULT 'SUBSCRIPTION'`, `ADD COLUMN checkout_id VARCHAR(64) UNIQUE`, the `orders_source_shape` CHECK, `order_items`, `checkouts`, and the partial unique index.
-- `order/src/domain/checkout_service.py`: `CheckoutService(repository, cart_client, user_client, pricing_client, wallet_client, subscription_client, settings_like)` with public `checkout(user_id, idempotency_key, cart_version, expected_pay_now_paise, correlation_id, now=None) -> dict`. Private steps: `_replay_or_resume`, `_validate_and_price` (FR-3 in order), `_start` (FR-4), `_charge` (FR-5), `_start_subscriptions` (FR-6), `_clear_cart` (FR-7), `_delivery_date(now)` (FR-8), `_result(checkout)` (FR-9). The resumable state machine is `step ∈ STARTED → PAID → SUBSCRIPTIONS_DONE → COMPLETED`, and every step is idempotent.
+- `order/migrations/0002_checkout.sql`: exactly MA-136 §7 (Postgres). Use `ALTER TABLE ... ALTER COLUMN ... DROP NOT NULL`, `ADD COLUMN source ... DEFAULT 'SUBSCRIPTION'`, `ADD COLUMN checkout_id VARCHAR(64) UNIQUE`, the `orders_source_shape` CHECK, `order_items`, `checkouts` (including `step` values `STARTED | CHARGING | PAID | SUBSCRIPTIONS_DONE` and the nullable `balance_after_paise BIGINT`), and the partial unique index.
+- `order/src/domain/checkout_service.py`: `CheckoutService(repository, cart_client, user_client, pricing_client, wallet_client, subscription_client, settings_like)` with public `checkout(user_id, idempotency_key, cart_version, expected_pay_now_paise, correlation_id, now=None) -> dict`. Private steps: `_handle_live_checkout` (FR-2a), `_validate_and_price` (FR-3 in order), `_start` (FR-4), `_charge` (FR-5), `_start_subscriptions` (FR-6), `_clear_cart` (FR-7), `_delivery_date(now)` (FR-8), `_result(checkout)` (FR-9).
+  - **State machine:** `step ∈ STARTED → CHARGING → PAID → SUBSCRIPTIONS_DONE`, then `status = COMPLETED`. Every step from `CHARGING` on is idempotent and bumps `updated_at`. A `STARTED` attempt is never resumed; it's discarded.
+  - **FR-2a live checkout** (by same key via FR-2, or by different key via FR-3.1):
+    - **Busy** = `updated_at` within `checkout_busy_seconds` → `CheckoutInProgressError(retry_after_seconds=…)`.
+    - Otherwise **claim** with `repository.claim_checkout(id, seen_updated_at)` (compare-and-set on `updated_at`). Losing the claim → `CheckoutInProgressError`.
+    - Claimed and `step = STARTED` → `repository.discard_checkout(id)`, then continue as a brand-new checkout with this request's body.
+    - Claimed and `step ≥ CHARGING` → resume from the first incomplete step with the stored snapshot, ignoring the body. With a different key this is an **adopt**: return the adopted checkout's outcome and don't store the new key.
+  - **`_start` (FR-4):** one-time lines exist → create an order even when `payNowPaise = 0`.
+    - `> 0` → order `CREATED`, `step = STARTED`.
+    - `= 0` → order inserted `CONFIRMED` with its `OrderConfirmed` outbox row in the same transaction, `step = PAID`, no debit (Wallet rejects `amountPaise ≤ 0`).
+    - No one-time lines → no order, `step = PAID`.
+    - FR-3.3 per-line pre-check failures (`SLOT_MISSING` / `START_DATE_PAST`) are written into `subscription_results` at insert time. `LineInvalidError` is raised only when there are no one-time lines and every subscription line fails.
+  - **`_charge` (FR-5):**
+    - First `repository.mark_checkout_charging(id)`: a compare-and-set `WHERE step = 'STARTED'`. 0 rows → `CheckoutInProgressError` (the attempt was discarded or taken over) and **no debit call**.
+    - Then debit. `DEBITED` → `mark_checkout_paid(id, balance_after_paise)` with Wallet's `balancePaise` (a replayed debit returns the original balance).
+    - `INSUFFICIENT_BALANCE` → 402 `details` `{balancePaise, requiredPaise, shortfallPaise}`, the same shape as the pre-check (`requiredPaise` per FR-3.7).
+  - **`_clear_cart` (FR-7):**
+    - First `remove_items(ifVersion = snapshot cart_version)`.
+    - On `CartVersionMismatchError`, re-read the cart and retry once at its current version. The retry removes only snapshot lines still present **and unchanged** (`productId`, `quantity`, `frequency`, `startDate`, `slotId` equal).
+    - Changed lines stay in the cart and go into `linesChangedDuringCheckout`.
+    - A second 409 → `CheckoutIncompleteError`.
+  - **`_result` (FR-9):**
+    - `walletBalanceAfterPaise` = stored `balance_after_paise`.
+    - If nothing was debited (no order, or a zero amount), read `wallet_client.get_balance` once at completion, or `None` if that read fails.
+    - Include `linesChangedDuringCheckout`.
 - `order/src/domain/checkout_models.py`: `Checkout`, `CheckoutLine`, `SubscriptionLineResult` dataclasses; enums `CheckoutStatus`, `CheckoutStep`.
-- `order/src/adapters/cart_client_adapter.py`: `HttpCartClient.get_cart(user_id)` and `.remove_items(user_id, item_ids, if_version, checkout_id)`. SigV4-signed (extend `shared/adapters/sigv4.py` with `sign_request(method, url, params, body, region)` keeping `sign_get_request` as a wrapper). Retries via `call_with_retry`; `409` → `CartVersionConflictError`; other failures → `CartUnavailableError`.
-- `order/src/adapters/subscription_client_adapter.py`: `HttpSubscriptionClient.create(...)` → returns `{subscriptionId, nextDeliveryDate}`; a `422` with an errorCode → `SubscriptionRejectedError(code)`; transport/5xx after retries → `SubscriptionUnavailableError`.
+- `order/src/adapters/cart_client_adapter.py`: `HttpCartClient.get_cart(user_id)` and `.remove_items(user_id, item_ids, if_version, checkout_id)`. SigV4-signed (extend `shared/adapters/sigv4.py` with `sign_request(method, url, params, body, region)` keeping `sign_get_request` as a wrapper). Retries via `call_with_retry`; `409 CART_VERSION_MISMATCH` (Cart's existing code) → `CartVersionMismatchError`; other failures → `CartUnavailableError`.
+- `order/src/adapters/subscription_client_adapter.py`: `HttpSubscriptionClient.create(...)` → `POST {base}/internal/subscriptions` → returns `{subscriptionId, nextDeliveryDate}`. **Any 4xx** (e.g. `422 PRODUCT_NOT_ELIGIBLE`, `400 INVALID_SCHEDULE`) → `SubscriptionRejectedError(errorCode)` with no retry, so the line is recorded `FAILED`. Transport/5xx after retries → `SubscriptionUnavailableError`.
 - `order/src/handlers/checkout_handlers.py`: `POST /orders/checkout`; `Idempotency-Key` header required (8–128 chars) else `400 VALIDATION_ERROR`; body `CheckoutRequest(cartVersion: int, expectedPayNowPaise: int | None)`.
 
 **Order files to modify:**
 - `order/src/domain/models.py`: `Order.subscription_id/product_id/quantity` optional; add `source` (`OrderSource` enum: `SUBSCRIPTION`/`CHECKOUT`), `checkout_id`, `items: list[OrderItem]`.
-- `order/src/domain/exceptions.py`: `CartEmptyError(409 CART_EMPTY)`, `CartChangedError(409 CART_CHANGED)`, `CheckoutInProgressError(409 CHECKOUT_IN_PROGRESS)`, `PriceChangedError(409 PRICE_CHANGED)`, `LineInvalidError(422 LINE_INVALID)`, `DeliveryAddressUnknownError(422 DELIVERY_ADDRESS_UNKNOWN)`, `InsufficientBalanceError(402 INSUFFICIENT_BALANCE)`, `WalletNotActiveError(403 WALLET_NOT_ACTIVE)`, `CheckoutIncompleteError(503 CHECKOUT_INCOMPLETE)`, `DependencyUnavailableError(503 DEPENDENCY_UNAVAILABLE)`, `ValidationError(400 VALIDATION_ERROR)`, plus adapter-level `CartUnavailableError`, `CartVersionConflictError`, `SubscriptionUnavailableError`, `SubscriptionRejectedError`.
+- `order/src/domain/exceptions.py`: `CartEmptyError(409 CART_EMPTY)`, `CartChangedError(409 CART_CHANGED)`, `CheckoutInProgressError(409 CHECKOUT_IN_PROGRESS, details.retryAfterSeconds)`, `PriceChangedError(409 PRICE_CHANGED)`, `LineInvalidError(422 LINE_INVALID)`, `DeliveryAddressUnknownError(422 DELIVERY_ADDRESS_UNKNOWN)`, `InsufficientBalanceError(402 INSUFFICIENT_BALANCE)`, `WalletNotActiveError(403 WALLET_NOT_ACTIVE)`, `CheckoutIncompleteError(503 CHECKOUT_INCOMPLETE)`, `DependencyUnavailableError(503 DEPENDENCY_UNAVAILABLE)`, `ValidationError(400 VALIDATION_ERROR)`, plus adapter-level `CartUnavailableError`, `CartVersionMismatchError`, `SubscriptionUnavailableError`, `SubscriptionRejectedError`.
 - `order/src/adapters/order_repository.py`: table columns match `0002`. New `order_items_table` and `checkouts_table` (JSON via `JSONColumn`), the partial unique index via `Index(..., unique=True, sqlite_where=..., postgresql_where=...)`, and the CHECK constraint. New methods:
   - `get_checkout(user_id, key)`, `get_live_checkout(user_id)`
-  - `start_checkout(checkout, order | None, items)` (one transaction; IntegrityError on the live-index → `CheckoutInProgressError`; on `(user_id, key)` → return the existing row)
-  - `mark_checkout_paid(checkout_id)`, `record_subscription_result(checkout_id, result)`, `mark_checkout_subscriptions_done`, `complete_checkout(checkout_id, result)`, `fail_checkout(checkout_id, result)`
+  - `start_checkout(checkout, order | None, items)`: one transaction; also inserts the `OrderConfirmed` outbox row when the order is zero-amount `CONFIRMED`. An IntegrityError on the live index means another request won the race to start first: re-read the live checkout and apply FR-2a (409 only if it's busy). An IntegrityError on `(user_id, key)` → return the existing row.
+  - `claim_checkout(checkout_id, seen_updated_at) -> bool` (compare-and-set on `updated_at`), `discard_checkout(checkout_id)` (deletes the checkout, its `CREATED` order and `order_items` in one transaction, guarded by `step = 'STARTED'`)
+  - `mark_checkout_charging(checkout_id) -> bool` (compare-and-set `WHERE step = 'STARTED'`), `mark_checkout_paid(checkout_id, balance_after_paise)`, `record_subscription_result(checkout_id, result)`, `mark_checkout_subscriptions_done`, `complete_checkout(checkout_id, result)`, `fail_checkout(checkout_id, result)`. Every write bumps `updated_at`.
   - `get_items(order_id)`
 
   `_row_to_order` handles null columns, and `get`/`list_for_user` load items for checkout orders.
@@ -110,16 +135,34 @@
 - `order/src/adapters/wallet_client_adapter.py`: add `get_balance(user_id) -> int` (paise) via `GET /wallet/internal/balance`.
 - `order/src/adapters/interfaces.py`: new ports for the above.
 - `order/src/domain/order_service.py`: `_serialize` adds `source`, `items`; event payloads add `source: "SUBSCRIPTION"`.
-- `order/src/config/env.py`: `cart_internal_base_url`, `subscription_internal_base_url`, `checkout_cutoff_hour_ist: int = 20`, `subscription_min_balance_paise: int = 50000`.
+- `order/src/config/env.py`: `cart_internal_base_url`, `subscription_internal_base_url`, `checkout_cutoff_hour_ist: int = 20`, `subscription_min_balance_paise: int = 50000`, `checkout_busy_seconds: int = 30`.
 - `order/src/handlers/dependencies.py`: `get_checkout_service()` (`lru_cache`, shares the engine with `get_order_service`; refactor into one cached `_engine()`).
 - `order/src/handlers/app.py`: include the checkout router.
 - `shared/events/OrderConfirmed.schema.json`, `OrderPaymentFailed.schema.json`: `subscriptionId` nullable and not required; `source` required (enum); optional `checkoutId`, `items`.
 - `order/README.md`: endpoints, the checkout flow diagram, and Known Gaps (the stale-checkout sweep is deferred).
 
 **Tests to write:**
-- `order/tests/unit/domain/test_checkout_service.py` (fakes for all ports in `conftest.py`): each FR-3 rejection with no side effects; one-time only / subscription only / mixed; `DEBITED` / `INSUFFICIENT_BALANCE` / `WALLET_NOT_ACTIVE` / wallet unavailable; subscription 422 continues vs transient stops; cart-clear 409 → re-read → retry; replay of `COMPLETED` / `PAYMENT_FAILED`; resume from `STARTED` (no second debit call beyond the idempotent one), `PAID` and `SUBSCRIPTIONS_DONE`; derived subscription idempotency keys; `startDate` ISO-timestamp parse; delivery date before and after the cut-off.
-- `order/tests/unit/adapters/test_order_repository.py` (extend): checkout rows round-trip; the live-index rejects a second `IN_PROGRESS`; the source-shape CHECK; items load.
-- `order/tests/unit/adapters/test_cart_client_adapter.py`, `test_subscription_client_adapter.py`: status mapping and retries (`requests` monkeypatched, as existing adapter tests do).
+- `order/tests/unit/domain/test_checkout_service.py` (fakes for all ports in `conftest.py`):
+  - **Validation:** each FR-3 rejection with no side effects.
+  - **Cart shapes:** one-time only / subscription only / mixed.
+  - **Debit outcomes:** `DEBITED` / `INSUFFICIENT_BALANCE` (details carry `requiredPaise` + `shortfallPaise`) / `WALLET_NOT_ACTIVE` / wallet unavailable.
+  - **Subscription create:** a 4xx (422 and 400) records `FAILED` and continues; a transient failure stops.
+  - **Cart clear:** 409 → re-read → retry removes unchanged lines only, and a changed line is listed in `linesChangedDuringCheckout`.
+  - **Replay:** `COMPLETED` / `PAYMENT_FAILED` return the stored result.
+  - **FR-2a:**
+    - busy → 409 with `retryAfterSeconds`
+    - `STARTED` + a changed body → discarded and re-validated (charged the new amount)
+    - `CHARGING` → resumed with the snapshot (one idempotent debit call)
+    - different key → adopted
+    - losing claim → 409
+    - `mark_checkout_charging` losing after a discard → **no debit call**
+    - resume from `PAID` and `SUBSCRIPTIONS_DONE`
+  - **Zero amount:** order `CONFIRMED` + outbox, **no debit call**.
+  - **FR-3.3:** past start date / missing slot → that line `FAILED`, the rest completes; all lines failing (no one-time) → 422.
+  - **`walletBalanceAfterPaise`:** from the stored `balance_after_paise` on a resume past `PAID`; from a balance read on a subscription-only cart; `None` when that read fails.
+  - **Other:** derived subscription idempotency keys; `startDate` ISO-timestamp parse; delivery date before and after the cut-off.
+- `order/tests/unit/adapters/test_order_repository.py` (extend): checkout rows round-trip (including `balance_after_paise`); the live-index rejects a second `IN_PROGRESS`; `claim_checkout` and `mark_checkout_charging` compare-and-sets (only one winner); `discard_checkout` removes checkout + order + items and refuses past `STARTED`; the source-shape CHECK; items load.
+- `order/tests/unit/adapters/test_cart_client_adapter.py`, `test_subscription_client_adapter.py`: status mapping and retries (`requests` monkeypatched, as existing adapter tests do). The Subscription client posts to `/internal/subscriptions`; 400 and 422 → `SubscriptionRejectedError` without retry; 5xx → retried → `SubscriptionUnavailableError`. The Cart client maps `409 CART_VERSION_MISMATCH` → `CartVersionMismatchError`.
 - `order/tests/integration/test_checkout_flow.py`: TestClient `POST /orders/checkout` happy path → one order + items + an outbox row validating against the updated `OrderConfirmed` schema; `GET /orders/me` shows `source: CHECKOUT` with items; same-key replay → identical body and no extra debit.
 - Existing `test_order_flow.py` stays green (subscription path unchanged apart from the added fields).
 
@@ -133,12 +176,19 @@
 - `lib/features/cart/models/cart_view.dart`: `payNowQuote`, `perDeliveryQuote`.
 - `lib/features/cart/data/cart_repository.dart`: `addItem(..., String? slotId)`; `startDate` sent as `yyyy-MM-dd`.
 - `lib/features/cart/bloc/product_config_bloc.dart`: the subscription confirm calls `_cartRepository.addItem(..., slotId: state.slotId)`; remove the `SubscriptionRepository` dependency and `_scheduleTypeFor`.
-- `lib/features/cart/presentation/product_config_screen.dart`: stop passing `SubscriptionRepository`; subscription CTA copy "Add subscription to cart"; success SnackBar "Subscription added to cart".
+- `lib/features/cart/presentation/product_config_screen.dart`: stop passing `SubscriptionRepository`. The subscription CTA **keeps "Add to Cart"** with the cart icon (MA-137 FR-3: the longer label doesn't fit the pill at 360 dp). Only the success SnackBar changes, to "Subscription added to cart"; one-time stays "Added to cart".
 - `lib/features/cart/bloc/cart_event.dart`: `CartRefreshRequested`, `CheckoutRequested`, `CheckoutFeedbackConsumed`.
-- `lib/features/cart/bloc/cart_state.dart`: `payNowQuote`, `perDeliveryQuote`, `walletBalancePaise`, `walletStatus`, `deliveryAddress`, `addressStatus`, `checkoutStatus` (`idle|submitting|incomplete`), `checkoutFailure`, `lineErrors`, `checkoutResult`; derived `hasSubscriptionLines`, `requiredPaise`, `shortfallPaise`, `canConfirm`.
-- `lib/features/cart/bloc/cart_bloc.dart`: new constructor deps `WalletBalanceRepository`, `ProfileRepository`, `CheckoutRepository`, `PendingCheckoutStore`. `_onStarted`/`_onRefreshRequested` load the cart, balance and profile in parallel (balance/profile failures are non-fatal). `_onCheckoutRequested` implements FR-7..FR-9 (persisted key, retries at 1/2/4 s, outcome mapping). Keep `quote` fallback behaviour for a stale backend (MA-137 §7).
-- `lib/features/cart/presentation/cart_screen.dart`: title "Review Cart"; `cart-add-more` button; the delivery card; the split summary; the wallet row with `cart-wallet-topup`; the "Confirm Order" CTA with progress, incomplete banner and dialogs; per-line error text; empty-state CTA awaits the push and refreshes. The subscription line subtitle reads "Daily · starts 27 Sep".
-- `lib/features/wallet/data/wallet_balance_repository.dart`: expose paise alongside rupees if it only returns rupees today (read it and keep the existing API).
+- `lib/features/cart/bloc/cart_state.dart`: `payNowQuote`, `perDeliveryQuote`, `walletBalancePaise`, `walletStatus`, `deliveryAddress`, `addressStatus`, `checkoutStatus` (`idle|submitting|incomplete`), `checkoutFailure`, `lineErrors`, `checkoutResult`, `pendingCheckout` (`PendingCheckout?`); derived `hasSubscriptionLines`, `requiredPaise`, `shortfallPaise`, `isCartLocked` (= `pendingCheckout != null`), `canConfirm`.
+- `lib/features/cart/bloc/cart_bloc.dart`: new constructor deps `WalletRepository` (paise; see MA-137 implementation revision), `ProfileRepository`, `CheckoutRepository`, `PendingCheckoutStore`, `CurrentUserIdProvider`.
+  - **Load/refresh:** `_onStarted`/`_onRefreshRequested` load the cart, balance and profile in parallel (balance and profile failures are non-fatal) and read the pending checkout for the current `sub`.
+  - **`_onCheckoutRequested` (FR-7..FR-9):**
+    - If a pending checkout exists, resend its **stored key and body** (`cartVersion`, `expectedPayNowPaise`). Otherwise build the body, persist `{key, cartVersion, expectedPayNowPaise}` **before** the call, and abort with a SnackBar if the write fails (never submit without a persisted key).
+    - Retry `Incomplete` at 1/2/4 s. On `InProgress(retryAfterSeconds)`, retry once after `retryAfterSeconds` (5 s if absent), then show the banner.
+    - Map outcomes per the FR-7 table, including `DEPENDENCY_UNAVAILABLE` → `Incomplete`, `VALIDATION_ERROR`/unknown 4xx → `Rejected` (clear key), and unknown 5xx → `Incomplete`.
+  - **Cart lock:** while `isCartLocked`, the quantity/remove/add-more handlers ignore their events.
+  - Keep `quote` fallback behaviour for a stale backend (MA-137 §7).
+- `lib/features/cart/presentation/cart_screen.dart`: title "Review Cart"; `cart-add-more` button; the delivery card; the split summary; the wallet row with `cart-wallet-topup`; the "Confirm Order" CTA with progress, incomplete banner and dialogs. The 402 dialog reads `details.shortfallPaise`. While the cart is locked, the CTA reads "Finish placing order" and quantity controls, remove buttons and `cart-add-more` are disabled. Per-line error text; empty-state CTA awaits the push and refreshes. The subscription line subtitle reads "Daily · starts 27 Sep".
+- Wallet balance: `CartBloc` reads `WalletRepository.getWallet()` (paise) rather than `WalletBalanceRepository` (whole rupees), so the shortfall is exact to the paisa (MA-137 implementation revision). `wallet_balance_repository.dart` is unchanged.
 - `lib/features/auth/models/user_profile.dart`: `DeliveryAddress? defaultAddress`.
 - `lib/core/router/app_router.dart`: `GoRoute('/order-success')` with the `extra` guard → `/home`.
 - `lib/main.dart`: provide `CheckoutRepository` (`DioCheckoutRepository`) and `PendingCheckoutStore`.
@@ -147,12 +197,25 @@
 **Files to create:**
 - `lib/features/auth/models/delivery_address.dart`: `DeliveryAddress.fromJson`, `formattedLines`, `cityStatePincode`.
 - `lib/features/checkout/data/checkout_repository.dart`: abstract + `DioCheckoutRepository` (`POST {orderBaseUrl}/orders/checkout`, `Idempotency-Key` header), mapping `ApiException.errorCode` → `CheckoutFailure`.
-- `lib/features/checkout/data/pending_checkout_store.dart`: `SharedPreferences` key `checkout.pendingKey.{userId}`; `read/write/clear`; all failures swallowed (per-device convenience only).
-- `lib/features/checkout/models/checkout_result.dart`, `checkout_failure.dart` (sealed).
-- `lib/features/checkout/presentation/order_success_screen.dart` (`order-success-id`, "Back to Home", "View subscriptions").
-- Test fakes: `test/helpers/fake_checkout_repository.dart`, `fake_pending_checkout_store.dart` (follow the existing fakes' location and pattern).
+- `lib/features/checkout/data/pending_checkout_store.dart`:
+  - Stores a `PendingCheckout {key, cartVersion, expectedPayNowPaise}` as JSON under `SharedPreferences` key `checkout.pendingKey.{sub}`, with `read/write/clear`.
+  - `write` **reports failure** (returns `false`) so the bloc can refuse to submit. `read` treats a corrupt value as absent.
+  - It's **not** cleared on logout (MA-137 FR-9). The key is scoped by the user.
+- `lib/core/auth/current_user_id_provider.dart`: `Future<String?> currentUserId()` decodes the `sub` claim from `SecureTokenStorage.readAccessToken()` (base64url payload, no network, no signature check). `null` when there's no token or it's malformed → Confirm disabled.
+- `lib/features/checkout/models/checkout_result.dart` (with `linesChangedDuringCheckout`, nullable `walletBalanceAfterPaise`), `checkout_failure.dart`: sealed `InsufficientBalance(shortfallPaise)`, `CartChanged`, `PriceChanged`, `LineInvalid(lines)`, `AddressUnknown`, `WalletNotActive`, `InProgress(retryAfterSeconds)`, `Incomplete`, `Rejected`.
+- `lib/features/checkout/presentation/order_success_screen.dart` (`order-success-id`, "Back to Home", "View subscriptions"). It shows reason hints for `FAILED` lines (`START_DATE_PAST` / `SLOT_MISSING`) and the `linesChangedDuringCheckout` note, and hides the balance row when it's `null`.
+- Test fakes: `test/helpers/fake_checkout_repository.dart`, `fake_pending_checkout_store.dart`, `fake_current_user_id_provider.dart` (follow the existing fakes' location and pattern).
 
-**Tests to write:** the bloc and widget scenarios listed in MA-137 §10, plus: `CartLineItem`/`CartView`/`UserProfile`/`ApiException.details` JSON parsing; the product-config test that asserted `FakeSubscriptionRepository.create` now asserts `FakeCartRepository.addItem(slotId: ...)`.
+**Tests to write:** the bloc and widget scenarios listed in MA-137 §10, plus:
+- JSON parsing: `CartLineItem`/`CartView`/`UserProfile`/`ApiException.details`/`CheckoutResult`.
+- The product-config test that asserted `FakeSubscriptionRepository.create` now asserts `FakeCartRepository.addItem(slotId: ...)`, and that the CTA still reads "Add to Cart".
+- The pending checkout persists key + body. A resume resends the **stored** body even after the cart changed locally.
+- The cart is locked while a checkout is pending (quantity, remove and add-more events ignored; CTA "Finish placing order").
+- Logout leaves the pending checkout in place.
+- A profile read failure still finds the pending key (the scope comes from the token `sub`). A store write failure → no request sent.
+- `InProgress(retryAfterSeconds)` → one delayed retry → banner.
+- `DEPENDENCY_UNAVAILABLE` / unknown 5xx → retried; `VALIDATION_ERROR` / unknown 4xx → key cleared + SnackBar.
+- `CurrentUserIdProvider` decodes `sub`, and returns `null` for a missing or malformed token.
 
 **Acceptance check:** `flutter analyze` clean; `flutter test` green (baseline 199 plus new tests).
 
@@ -187,6 +250,8 @@ Baseline before changes: cart 108, user 110, subscription 66, order 36, Flutter 
 - **Money path.** Double-charge protection relies on four layers (client key, `checkouts` unique key, `orders.checkout_id` unique, Wallet ledger ref). Tests must cover replay and resume explicitly; don't merge without them.
 - **SQLite vs Postgres fidelity.** Partial unique index and CHECK constraints behave the same in SQLite 3.8+, but `ALTER COLUMN DROP NOT NULL` exists only in Postgres. The migration is Postgres-only and tests use `create_schema`. Verify `0002` against local-dev Postgres with `apply_migrations.py` before the PR.
 - **Uncommitted app work on `main`.** The in-progress (uncommitted, unrelated) `AuthNeedsRegistration` / `RetryRequested` changes touch `product_config_bloc.dart` and `product_config_screen.dart`, which MA-137 also edits (the confirm branch and constructor). Expect a small conflict when both land. Resolve by keeping both: the `RetryRequested` handler stays, and the subscription confirm goes to the cart.
-- **Stale `IN_PROGRESS` checkouts** block a user's next checkout until the app retries (it does so automatically). The reconciliation sweep is deferred per MA-136 §11 and must land before production.
+- **Stale `IN_PROGRESS` checkouts** block a user for at most `ORDER_CHECKOUT_BUSY_SECONDS` (30 s). After that, any Confirm (same or new key) discards the attempt if it's `STARTED`, or adopts it if it's `≥ CHARGING` (MA-136 FR-2a). The reconciliation sweep is still deferred per MA-136 §11 and must land before production: it finishes paid checkouts whose customer never returns.
+- **Concurrency correctness** rests on two compare-and-sets (`claim_checkout` on `updated_at`, `mark_checkout_charging` on `step`). Both need a repository test that proves only one writer wins, and the SQLite test engine must use the same `UPDATE … WHERE` shape as Postgres (no read-then-write).
+- **Pending-key scope deviation:** MA-137 FR-9 names `checkout.pendingKey.{userId}`. The plan scopes by the Cognito `sub` instead, so the key never depends on a network read. The scope is still per user; record this in MA-137's implementation revision.
 - **Cart infra IAM routes** can't be exercised locally (the local shim doesn't verify SigV4). Covered by the CDK assertion test only.
 - **Recovery:** each spec is a separate commit, so a failing MA-136 can be reverted without losing MA-135. The migration is additive apart from relaxed NOT NULLs, and a rollback script is not required for local-dev.
