@@ -28,20 +28,28 @@ MA-23's own impl plan (`mobile-app/tasks/MA/MA-23/impl-plan/`).
 This repo's own PR #11 (2026-08-21) review found six issues in this plan/its early
 implementation. Re-checked against the real code today, not just this document:
 
+> **Re-checked 2026-10-02** against `milkful2026/services` `main` (`e84540a`), after a review of
+> specs PR #13 found this section already out of date: the cart work landed in services
+> `6cbeb86` (repository) and `6d16433` (CDK stack) on 2026-08-27, about an hour after this
+> section was written. The table below is updated to match the code; the summary that follows it
+> replaces the 2026-08-27 one.
+
 | Finding | Status |
 |---|---|
-| §4A's internal endpoint would ship public and unauthenticated ("network isolation" doesn't exist for a Lambda + HttpApi service, unlike Inventory's Fargate-behind-private-ALB setup this plan borrowed the reasoning from) | **Fixed.** The route now uses `HttpIamAuthorizer` (AWS_IAM/SigV4) in `user_stack.py`, verified via `cdk synth` — the route synthesizes with `AuthorizationType: AWS_IAM`, not `JWT`, not unauthenticated. `internal_caller_role_arns` (defaults to empty — nobody granted yet) is where Cart Service's own execution role ARN gets added once its CDK stack exists; the route's `execute-api` ARN is exported via `CfnOutput` for that stack to import. §4A below is updated to match — do not reintroduce the old "network isolation" framing. |
+| §4A's internal endpoint would ship public and unauthenticated ("network isolation" doesn't exist for a Lambda + HttpApi service, unlike Inventory's Fargate-behind-private-ALB setup this plan borrowed the reasoning from) | **Fixed.** The route now uses `HttpIamAuthorizer` (AWS_IAM/SigV4) in `user_stack.py`, verified via `cdk synth` — the route synthesizes with `AuthorizationType: AWS_IAM`, not `JWT`, not unauthenticated. Cart Service's CDK stack now exists (`cart/infra/cart/cart_stack.py`, services `6d16433`) and exports its execution role as `ExecutionRoleArn`, and `cart/src/adapters/user_client_adapter.py` already SigV4-signs its calls. **One deploy step is still open:** that ARN has not been added to `internal_caller_role_arns` in `user/infra/app.py`, which still defaults to empty, so a deployed `GET /cart` fails with `ADDRESS_LOOKUP_UNAVAILABLE` (API Gateway 403) until it is (§4A step 4). §4A below is updated to match — do not reintroduce the old "network isolation" framing. |
 | §4A claimed no `UserProfile` field/repository change was needed for `default_address_state`, but at the time neither the field nor the repository population existed | **Fixed** (as a side effect of unrelated work, `services/user` PR #10's third commit, `69a65fe`) — `default_address_state` is now genuinely on `UserProfile`, populated in `user_repository.py`, and serialized on `GET /users/me`. §4A's original claim is accurate now, not just asserted. |
-| §4A didn't mention that `get_my_profile` raises `UserNotFoundError` rather than returning `None`, so the handler would 500 instead of returning `{"defaultAddressState": null}` | **Fixed** — the actual handler (`internal_address_state_handler.py`) catches `UserServiceError` broadly and maps it to the correct HTTP status (404 for `UserNotFoundError`), covered by its own test suite. |
+| §4A didn't mention that `get_my_profile` raises `UserNotFoundError` rather than returning `None`, so the handler would 500 instead of returning `{"defaultAddressState": null}` | **Fixed, with a different contract than the finding assumed.** The handler (`internal_address_state_handler.py`) catches `UserServiceError` and returns **`404 USER_NOT_FOUND`** for an unknown user, not `200 {"defaultAddressState": null}`. Callers must treat that 404 as "no default address"; Cart's `user_client_adapter.py` does (it returns `None`). §4A's response contract below now says so. |
 | §8 of the merged MA-121 spec explicitly says "a small, additive consumer of an existing capability, not a new endpoint on `user`'s side," but this plan adds a new endpoint anyway, without reconciling the contradiction | **Still open.** This plan still adds a new endpoint (§4A) — that's the correct call given `get_my_profile`'s actual signature (it needs `cognito_sub`, which `user`'s existing public routes resolve from the caller's own JWT, not an arbitrary target user), but MA-121 §8 itself hasn't been revised to match. Whoever owns MA-121 should reconcile the spec text with what's actually being built, not this plan silently overriding the spec. |
-| MA-121 §6/§11's Redis read-through cache (flagged as needing Platform/Architecture sign-off before implementation) is absent from this plan with no acknowledgment | **Still open.** `grep -i redis` over this entire plan still returns nothing. Not implemented, not deferred-with-a-note, not sign-off-requested — just silently absent, same as PR #11 found it. If Redis is out of scope for this pass, that should be a stated decision here, not silence. |
-| §4D's DynamoDB schema gives `ITEM#`/`IDEMPOTENCY#` rows a TTL but the `META` row (holding `cartVersion`) has none, so `cartVersion` could persist at a stale non-zero value after every item has expired | **Still open.** §4D below is unchanged — `META`'s `cartVersion` still has no TTL or reset policy. FR-1's "no cart and empty cart are the same state" implies `cartVersion` should read `0` once items expire; nothing here makes that true. |
+| MA-121 §6/§11's Redis read-through cache (flagged as needing Platform/Architecture sign-off before implementation) is absent from this plan with no acknowledgment | **Deferred, and now stated.** Not built in this pass. `cart_stack.py`'s docstring records the decision ("No VPC, no Redis": the cache needs the Platform/Architecture sign-off MA-121 §6/§11 asks for, and nothing else in Cart needs a VPC). Cart reads DynamoDB directly. Building it later means that sign-off, a VPC-attached Lambda and a cache cluster; until then it is an open item against MA-121, owned by whoever owns that spec (§8). |
+| §4D's DynamoDB schema gives `ITEM#`/`IDEMPOTENCY#` rows a TTL but the `META` row (holding `cartVersion`) has none, so `cartVersion` could persist at a stale non-zero value after every item has expired | **Fixed** in services `6cbeb86`. `cart_repository.py` refreshes `META`'s own `expiresAt` to the same 30-day window as `ITEM#` rows on every mutation, so once everything has expired `get_cart` finds no rows and returns `cartVersion = 0`, the same as a cart that never existed. §4D's schema below is updated. |
 
-**Net: the one finding that actually blocked shipping (the auth gap) is fixed and verified. Of the
-other five, two are genuinely resolved (the `UserProfile` field, the missing-user handling); three
-— the MA-121 §8 contradiction, the silently-dropped Redis cache, and the `cartVersion` TTL gap —
-are still exactly where the review left them and need real decisions, not just
-re-acknowledgment.**
+**Net (2026-10-02): the auth gap, the `UserProfile` field, the missing-user handling and the
+`cartVersion` TTL are fixed in code. Two items remain, both needing a person rather than code:**
+- **Deploy wiring:** add Cart's `ExecutionRoleArn` to `internal_caller_role_arns` in
+  `user/infra/app.py` (§4A step 4). Without it, deployed Cart can't reach the User route.
+- **Spec reconciliation (MA-121's owner):** §8's "not a new endpoint on `user`'s side" contradicts
+  §4A as built, and §6/§11's Redis cache is deferred pending sign-off. Both need MA-121 itself
+  updated, or the sign-off given.
 
 ## 2. Prerequisites
 
@@ -132,9 +140,20 @@ built, not the original (unauthenticated) design.
   isolation" as originally planned, since that reasoning doesn't hold for a Lambda + HttpApi service
   (see §1a). Calls the existing `RegistrationService.get_my_profile(cognito_sub)` domain method
   unchanged, and catches `UserServiceError` broadly so a missing user maps to 404 rather than 500.
-- Response: `{"defaultAddressState": "Karnataka" | null}` — deliberately narrower than
-  `GET /users/me`'s full profile (§11 of MA-93's own spec already establishes "keep this minimal");
-  Cart Service has no legitimate need for the caller's name/mobile/accountType.
+- Response (in User Service's standard `{requestId, status, data}` envelope) — deliberately
+  narrower than `GET /users/me`'s full profile (§11 of MA-93's own spec already establishes "keep
+  this minimal"); Cart Service has no legitimate need for the caller's name/mobile/accountType:
+
+  | Case | Status | Body |
+  |---|---|---|
+  | User exists | `200` | `data: {"defaultAddressState": "Karnataka" \| null}` (`null` = no default address) |
+  | No user for `cognitoSub` | **`404`** | `status: "error"`, `errorCode: "USER_NOT_FOUND"` — **not** `200 {"defaultAddressState": null}` |
+  | `cognitoSub` missing | `400` | `errorCode` from `ValidationError` |
+
+  **Caller contract:** a caller must treat `404 USER_NOT_FOUND` the same as
+  `defaultAddressState: null` ("no default address"), and only other failures as "lookup
+  unavailable". Cart's `user_client_adapter.py` does this (404 → `None`, which
+  `cart_service.py` turns into `DeliveryAddressRequiredError` either way); any new caller must too.
 
 **Real auth mechanism (`user_stack.py`):**
 1. The route is registered with `apigwv2_authorizers.HttpIamAuthorizer()` — AWS_IAM/SigV4
@@ -148,12 +167,14 @@ built, not the original (unauthenticated) design.
 3. The route's `execute-api` ARN is also exported via `CfnOutput` (`InternalAddressStateRouteArn`),
    so a caller's own stack can instead grant itself directly once it exists, without `user_stack.py`
    needing to know about it in advance.
-4. **Cart Service's own execution role doesn't exist yet** (MA-96 itself isn't built) — so today,
-   `internal_caller_role_arns` has nothing real to reference. This route is deployed but
-   unreachable by design until that changes. Whoever builds Cart's own CDK stack (§4H) must either
-   pass its execution role's ARN into `UserStack`, or use the exported output to grant itself —
-   this plan's own §4H doesn't do that yet (Cart's stack isn't built), so it's a real follow-up, not
-   assumed-done here.
+4. **Cart's side is built; the grant is not wired yet.** Cart's CDK stack (§4H, services
+   `6d16433`) exports its Lambda execution role as `ExecutionRoleArn`, and Cart's
+   `user_client_adapter.py` SigV4-signs every call to this route. What remains is a manual
+   cross-stack step: add that ARN to `internal_caller_role_arns` in `user/infra/app.py`, which
+   still defaults to empty (the two are separate CDK apps, so nothing wires it automatically).
+   Until then a deployed `GET /cart` fails with `ADDRESS_LOOKUP_UNAVAILABLE` (an API Gateway 403,
+   not a missing route). Alternatively, Cart's stack can grant itself using the exported
+   `InternalAddressStateRouteArn`.
 5. Local dev: `services/local-dev/_lambda_local_server.py` doesn't emulate IAM/SigV4 at all (same
    as it doesn't verify the Cognito JWT authorizer's signature on public routes) — the route is
    reachable directly from `localhost:8002` in local dev regardless of the real IAM restriction.
@@ -233,6 +254,8 @@ cart (table)
   addedAt (S), expiresAt (N)    -- TTL, 30 days from last write
   -- META row (one per user):
   cartVersion (N)                -- incremented on every mutation (FR-1/FR-3)
+  expiresAt (N)                  -- TTL, 30 days from last write, refreshed on every mutation
+                                 -- like ITEM# rows, so a fully expired cart reads cartVersion 0
   -- IDEMPOTENCY# rows:
   responseBody (S), expiresAt (N) -- TTL, 24h
 ```
@@ -397,19 +420,20 @@ One commit per lettered step in §4, in order — mirrors the MA-23 impl plan's 
   gate but does require reporting what is added and why" — reported here, not requiring the
   new-service architect gate.
 - ~~**§4A's internal endpoint had no real auth**~~ — **Fixed 2026-08-27**, see §1a/§4A:
-  `HttpIamAuthorizer` + `internal_caller_role_arns`, verified via `cdk synth`. Still requires a
-  human to wire Cart Service's real execution role ARN in once its own CDK stack (§4H) exists — the
-  route is deployed but deliberately unreachable until then.
+  `HttpIamAuthorizer` + `internal_caller_role_arns`, verified via `cdk synth`.
+- **Deploy blocker: Cart's role isn't granted on User's internal route yet.** Cart's stack (§4H)
+  exists and exports `ExecutionRoleArn`, but `user/infra/app.py` still passes no
+  `internal_caller_role_arns`. Until a human adds it, deployed `GET /cart` fails with
+  `ADDRESS_LOOKUP_UNAVAILABLE` (§4A step 4).
 - **MA-121 §8 still says this should be "not a new endpoint on `user`'s side," contradicting §4A as
   actually built.** Not a code problem — `get_my_profile` needs a target `cognito_sub` that a
   reused public route has no way to accept safely — but the spec text itself needs a reviewer to
   reconcile it, not another plan to silently route around it.
-- **Redis read-through cache (MA-121 §6/§11) is still completely absent from this plan**, with no
-  implementation, no explicit deferral, and no sign-off request — exactly as PR #11's review found
-  it. Needs an explicit decision (build it with sign-off, or formally defer it) before this story is
-  considered complete against its own spec.
-- **`cartVersion`'s `META` row still has no TTL/reset policy** (§4D) — line items and idempotency
-  records expire; the version counter doesn't, so a cart that's fully expired could still report a
-  stale non-zero `cartVersion`, inconsistent with FR-1's "no cart and empty cart are the same state."
-  Needs a concrete fix (TTL on `META` too, or an explicit reconciliation rule), not just
-  re-acknowledgment.
+- **Redis read-through cache (MA-121 §6/§11) is deferred, not built.** Recorded in
+  `cart_stack.py` ("No VPC, no Redis"): it needs the Platform/Architecture sign-off MA-121 asks
+  for, and Cart reads DynamoDB directly meanwhile. Story completeness against MA-121 depends on
+  that spec's owner either giving the sign-off (then: VPC-attached Lambda + cache cluster) or
+  revising §6/§11 to drop or postpone the cache.
+- ~~**`cartVersion`'s `META` row has no TTL/reset policy**~~ — **Fixed** in services `6cbeb86`:
+  `META`'s `expiresAt` is refreshed with the 30-day window on every mutation (§4D), so a fully
+  expired cart reads `cartVersion = 0`.
