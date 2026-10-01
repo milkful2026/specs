@@ -74,14 +74,25 @@
 
 No other discrepancies found between the three specs' contracts, terminology, or scope boundaries.
 
+## Review round 2 — post-implementation `/code-review` findings (2026-10-01)
+
+A `/code-review` run against the merged specs (after User/Subscription Service implementation had begun) found four further issues the round-1 review above missed — all resolved on `spec/MA-39-revision`:
+
+| # | File | Finding | Resolution |
+|---|------|---------|------------|
+| 2 | MA-140 §4 FR-1/FR-2 | The candidate-set query (FR-1) only included `ACTIVE` subscriptions and not-yet-started `PAUSED` ones, and FR-2's own write-time guard skipped *every* already-`PAUSED` subscription — together, a customer's already-in-effect temporary pause was never reached by the admin override §9 itself claimed would happen, so it would silently auto-resume on its original schedule even while the account stayed deactivated. | FR-1 widened to every non-`STOPPED` subscription; FR-2's skip condition narrowed to only `PAUSED` subscriptions with `pause_until` already `None` (a true repeat), so a `PAUSED` subscription with a real `pause_until` is now correctly overridden. Workflow diagram, edge-case table, and testing strategy (§6/§9/§10) updated to match, including a new testing requirement that at least one test exercise this through the consumer's own entrypoint, not only the inner method directly — which is how the original gap passed review. |
+| 3 | MA-139 §4 FR-5 | Reactivate had no idempotency guarantee, unlike FR-3/FR-4 (added in round 1) — a repeat reactivate call on an already-`Active` account would write a duplicate `Active`→`Active` history row and re-publish the event. | FR-5 given the same idempotent-200, still-calls-Cognito treatment as FR-3/FR-4. |
+| 4 | MA-139 §4 FR-3 | A cross-reference for "what `until` means" pointed at §9 (Edge Cases), but the actual definition lives in FR-7. | Corrected to point at FR-7. |
+| 5 | MA-39/step5-review.md | This file's own decision-record item 4 still listed the sweep schedule as an open question after MA-139 FR-7/§12 had already resolved it (00:05 IST). | Corrected (struck through, see item 4 below). |
+
 ## Verdict
 
-**PASS** — all individual-quality and cross-specification coherence checks are satisfied; the one finding from this review pass was resolved on `spec/MA-39` (table above) without changing scope or the cross-service contract.
+**PASS** — all individual-quality and cross-specification coherence checks are satisfied; all findings from both review rounds are resolved on `spec/MA-39-revision` without changing scope or the cross-service contract.
 
 ### Decision records / follow-up actions (carried, not blocking)
 
 1. **Role-gate confirmation needed** — MA-139 §12 Q3 and MA-141 §12 Q1 both flag the same open question (should Deactivate require SuperAdmin specifically, or is Ops sufficient for all three actions uniformly) — both specs currently propose the same uniform Ops+SuperAdmin default; needs an architect/product confirmation before or during implementation, not blocking spec approval.
 2. **Identity & Auth checklist item** — MA-139 §8/§12 Q1: confirm `UserDisabledException` maps to a clean client error in the existing login handlers; a small implementation-time spike, not a spec.
 3. **List scale / pagination approach** — MA-141 §12 Q2: recommend server-side search from day one (MA-139's list endpoint already supports it), unlike MA-128's client-side-first precedent, given the larger expected customer-account volume; flagged for architect confirmation.
-4. **Sweep schedule time** — MA-139 §12 Q2: pick an off-peak time that doesn't collide with Subscription's own Daily Run cut-off window; implementation-time detail.
+4. ~~Sweep schedule time~~ — resolved: MA-139 FR-7/§12 Q2 now specifies 00:05 IST, ahead of the Subscription Daily Run's own cut-off window.
 5. **Reason persistence on the subscription row** — MA-140 §12 Q1: this spec recommends not persisting it there (rely on User Service's own history as the source of "why"), flagged for confirmation since it's the one place MA-140 makes a call not explicitly directed by the approved decomposition.
