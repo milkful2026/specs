@@ -61,12 +61,12 @@ All three ship in **one code PR** (one feature branch, one commit per spec). MA-
   - `listMine` → `GET ${AppConfig.orderBaseUrl}/orders/me` with query `limit`, `cursor`;
   - `getById` → `GET …/orders/{id}`.
   - Errors surface as `ApiException`, unchanged.
-- `lib/features/orders/domain/order_status_copy.dart` — `StatusChipSpec(label, tone, icon)` with `tone` ∈ {neutral, error, warning, primary}; `statusChip(OrderStatus)` per MA-145 FR-6 (unknown → title-cased raw value, neutral, no icon); `scheduledChip`; `bool isKnownNotCharged(OrderSummary)` = `CANCELLED` or `PAYMENT_FAILED`, or (`NEEDS_ATTENTION` and `failureReason == 'CUTOFF_PASSED'`). MA-146 adds reason copy to this file.
+- `lib/features/orders/domain/order_status_copy.dart` — `StatusChipSpec(label, tone, icon)` with `tone` ∈ {neutral, error, warning, primary}; `statusChip(OrderStatus)` per MA-145 FR-6 (unknown → title-cased raw value, neutral, no icon); `scheduledChip`; `bool isKnownNotCharged(OrderSummary)` = `CANCELLED` or `PAYMENT_FAILED`, or (`NEEDS_ATTENTION` and `failureReason == 'CUTOFF_PASSED'`); `bool isAmountStruck(OrderSummary)` = `isKnownNotCharged` **or** `FAILED` (MA-145 FR-8: a legacy `FAILED` order is struck through and left out of totals even though its charge isn't known, so it is not "known not charged"). MA-146 adds reason copy to this file.
 - `lib/features/orders/domain/order_buckets.dart` — pure functions:
   - `Buckets bucketOrders(List<OrderSummary>, DateTime today)` → `today`, `upcoming`, `past`;
   - `List<ScheduledEntry> scheduledEntries(List<SubscriptionView>, List<OrderSummary> orders, DateTime today)`: status ≠ STOPPED, `nextDeliveryDate` non-null and after today, no order with the same (subscriptionId, date);
   - `List<DayGroup> groupByDate(List<OrderEntry>, {required bool ascending})`, where orders come before scheduled entries within a day;
-  - `DayTotal dayTotal(List<OrderEntry>, Map<String, Product?> products)` → `paise`, `hasEstimate`. It excludes `isKnownNotCharged`, estimates scheduled entries as `rupeesToPaise(price) * quantity`, and skips unknown prices;
+  - `DayTotal dayTotal(List<OrderEntry>, Map<String, Product?> products)` → `paise`, `hasEstimate`. It excludes `isAmountStruck` (CANCELLED, PAYMENT_FAILED, FAILED, NEEDS_ATTENTION/CUTOFF_PASSED), estimates scheduled entries as `rupeesToPaise(price) * quantity`, and skips unknown prices;
   - `int? estimatePaise(ScheduledEntry, Product?)`.
 - `lib/features/orders/bloc/my_orders_event.dart` — `MyOrdersOpened`, `MyOrdersRefreshed` (carries a `Completer` for `RefreshIndicator`), `PastPageRequested`, `RetryFailedSources`.
 - `lib/features/orders/bloc/my_orders_state.dart` — `SourceStatus { loading, loaded, failed }`; `PagingStatus { idle, loading, failed }`. State holds `ordersStatus, subscriptionsStatus, orders (all loaded pages, deduped by orderId), nextCursor, subscriptions, products (Map<String, Product?>, where null = lookup failed), pagingStatus, refreshFailed (for the SnackBar)`, with `copyWith`, plus derived getters that call `order_buckets` with the injected today.
@@ -77,9 +77,9 @@ All three ship in **one code PR** (one feature branch, one commit per spec). MA-
   - **Refresh discards a stale page:** keep a `generation` counter bumped on each Opened/Refreshed, and ignore page results from an older generation.
   - **RetryFailedSources:** re-runs only the sources whose status is `failed`.
 - `lib/features/orders/presentation/my_orders_screen.dart` — `MyOrdersScreen` creates `BlocProvider(create: MyOrdersBloc(context.read…)..add(MyOrdersOpened()))`. Layout: `Scaffold` with `AppBar(title: 'My Orders')` (automatic back arrow, no actions); `RefreshIndicator` over a `NestedScrollView` (or `CustomScrollView`) holding the Today section, then a `TabBar` (Upcoming/Past Orders) and a `TabBarView`. The Past tab's scroll listener dispatches `PastPageRequested` within 300 px of the end.
-- `lib/features/orders/presentation/widgets/today_section.dart` — header (truck icon, "Today's Delivery", "N Items"/"1 Item" pill), item cards, the "Order total ₹X" header for multi-item orders, and the empty/failed text per the MA-145 FR-5/FR-11 empty-state rule.
+- `lib/features/orders/presentation/widgets/today_section.dart` — header (truck icon, "Today's Delivery", "N Items"/"1 Item" pill), item cards, the "Order total ₹X" header for multi-item orders (amounts struck through when `isAmountStruck`), and the empty/failed text per the MA-145 FR-5/FR-11 empty-state rule.
 - `lib/features/orders/presentation/widgets/day_group_card.dart` — date label (see `formatGroupDate` below), total label ("₹X Total" / "≈ ₹X Total"), one `EntryRow` per entry.
-- `lib/features/orders/presentation/widgets/entry_row.dart` — thumbnails (≤ 2 plus a "+N" bubble), summary text rules, a chip only if the status is not CONFIRMED (scheduled entries always show one), chevron (`Semantics(label: 'Open order')`). Tapping pushes `/orders/{id}` or `/orders/scheduled/{subscriptionId}` with `extra: entry`.
+- `lib/features/orders/presentation/widgets/entry_row.dart` — thumbnails (≤ 2 plus a "+N" bubble), summary text rules, the order's amount (struck through when `isAmountStruck`), a chip only if the status is not CONFIRMED (scheduled entries always show one), chevron (`Semantics(label: 'Open order')`). Tapping pushes `/orders/{id}` or `/orders/scheduled/{subscriptionId}` with `extra: entry`.
 - `lib/features/orders/presentation/widgets/status_chip.dart` — renders a `StatusChipSpec` using `Theme.of(context).colorScheme` tokens (neutral = `surfaceContainerHighest`, error = `errorContainer`, warning = a `tertiaryContainer`-based amber, primary = `primaryContainer`); semantics `"Status: {label}"`.
 - `lib/features/orders/presentation/widgets/product_thumb.dart` — `Image.network` with a placeholder and error builder.
 - `lib/features/orders/presentation/order_formatting.dart` — `formatGroupDate(DateTime date, DateTime today, {required bool upcoming})`: "Tomorrow, 24 Oct" / "Yesterday, 22 Oct" / "Sat, 26 Oct", plus " 2025" when the year differs, via `intl` `DateFormat`.
@@ -103,8 +103,8 @@ All three ship in **one code PR** (one feature branch, one commit per spec). MA-
 - **Unit — `order_buckets_test.dart`:**
   - buckets across today, past and future for every status;
   - `scheduledEntries`: ACTIVE with a future date → entry; PAUSED with a future date → entry; STOPPED → none; null date → none; date == today → none; an order already for (sub, date) → none;
-  - `dayTotal`: excludes CANCELLED, PAYMENT_FAILED and NEEDS_ATTENTION/CUTOFF_PASSED; includes NEEDS_ATTENTION/SWEEP_EXHAUSTED; estimate `32.49 × 1` → `3249`; `37.485 × 2` → `7498` (unit rounded first: 3749 × 2); mixed day `6500 + estimate` → paise sum, `hasEstimate: true`; unknown price → skipped.
-- **Unit — `order_status_copy_test.dart`:** every row of FR-6; `isKnownNotCharged` truth table.
+  - `dayTotal`: excludes CANCELLED, PAYMENT_FAILED, FAILED and NEEDS_ATTENTION/CUTOFF_PASSED; includes NEEDS_ATTENTION/SWEEP_EXHAUSTED; estimate `32.49 × 1` → `3249`; `37.485 × 2` → `7498` (unit rounded first: 3749 × 2); mixed day `6500 + estimate` → paise sum, `hasEstimate: true`; unknown price → skipped.
+- **Unit — `order_status_copy_test.dart`:** every row of FR-6; `isKnownNotCharged` and `isAmountStruck` truth tables (they differ only on FAILED: not known-not-charged, but struck).
 - **Bloc — `my_orders_bloc_test.dart`** (fakes: new `FakeOrderRepository` in `test/fakes/`, plus the existing `FakeSubscriptionRepository` and `FakeCatalogRepository`; fixed clock):
   - opened → loading → loaded with the correct derived buckets;
   - orders fail, subscriptions load → `ordersStatus: failed`; `RetryFailedSources` calls only `listMine`;
@@ -115,6 +115,7 @@ All three ship in **one code PR** (one feature branch, one commit per spec). MA-
   - refresh failure keeps the data and sets `refreshFailed`.
 - **Widget — `my_orders_screen_test.dart`** (fakes + a `GoRouter` harness with stub routes for `/orders/:id`, `/orders/scheduled/:id` and `/catalog`; fixed clock):
   - today: 1 CONFIRMED 2-item order + 1 CANCELLED single-item → "Today's Delivery", "3 Items", "Order total" once, "Order Placed", "Cancelled";
+  - a FAILED order in an Upcoming/Past group → "Failed" chip, amount rendered with `TextDecoration.lineThrough`, and not in the group's "₹X Total";
   - upcoming merge: "Tomorrow, …", "(Subscription)", "Scheduled", "≈ ₹… Total";
   - no "Delivered" text anywhere for a past CONFIRMED order;
   - taps push the right locations;
@@ -136,11 +137,14 @@ All three ship in **one code PR** (one feature branch, one commit per spec). MA-
   - `load()`: with `initial`, emit loaded without a network call (a product lookup only). Otherwise `subscriptionRepo.get(id)` → build the entry (same rule as `scheduledEntries`: not STOPPED, date after today); if it's not scheduled → `ScheduledDeliveryGone`.
   - `refresh()`: fetch the subscription. If the fetched date ≠ the shown date, look in the first page of `orderRepo.listMine()` for `subscriptionId` + `deliveryDate == shown date` → `change: becameOrder(orderId)`; otherwise (including a lookup failure) → `change: dateChanged`. If gone → `ScheduledDeliveryGone`.
   - The first load never does the orders lookup.
+  - States: `ScheduledDeliveryLoading`, `ScheduledDeliveryLoaded(entry, product, change)`, `ScheduledDeliveryGone`, `ScheduledDeliveryError`.
+  - **Errors (MA-146 §8 "Error → Retry"):** any failure of `subscriptionRepo.get` in `load()` or `refresh()` (network, 5xx, 404) → `ScheduledDeliveryError`. A product lookup failure is never an error (null product, "Price confirmed the evening before"), and a failed orders lookup in `refresh()` is `dateChanged`, not an error.
 - `lib/features/orders/presentation/order_detail_screen.dart` — `OrderDetailScreen(orderId)` (own `BlocProvider`), with `RefreshIndicator` and sections per FR-2..FR-7 using the shared cards.
 - `lib/features/orders/presentation/scheduled_delivery_screen.dart` — `ScheduledDeliveryScreen(subscriptionId, entry)`. A `BlocListener` shows the SnackBars:
   - "This delivery is now an order." with a **View order** action → `context.pushReplacement('/orders/{orderId}')`;
   - "Your next delivery has changed.";
   - **Manage subscription** → `context.go('/subscriptions')`.
+  - `ScheduledDeliveryError` → "Couldn't load this delivery." + a **Retry** button that calls `load()`.
 - `lib/features/orders/presentation/widgets/detail_cards.dart` — `DetailHeaderCard` (display ID, long-press → `Clipboard.setData(full id)` + "Order ID copied"; placed-on in IST; status banner; reason text), `ItemsCard`, `BillCard` (Grand Total / Estimated Total, strike-through and captions per FR-5, "—" for 0), `DeliveryInfoCard`, `PaymentMethodCard` ("Milkful Wallet").
 
 **Files to modify:**
@@ -172,7 +176,10 @@ All three ship in **one code PR** (one feature branch, one commit per spec). MA-
   - no `initial` → `get` called → loaded, no `listMine` call;
   - STOPPED / null date → gone; PAUSED with a future date → loaded;
   - refresh with a new date + a matching order on page 1 → `becameOrder(orderId)`;
-  - a new date with no match → `dateChanged`; `listMine` throws → `dateChanged`.
+  - a new date with no match → `dateChanged`; `listMine` throws → `dateChanged`;
+  - no `initial` and `get` throws (`getException`, and a missing ID → 404) → error; `load()` again after clearing the exception → loaded;
+  - `refresh()` when `get` throws → error;
+  - product lookup throws → loaded with a null product (not an error).
 - **Widget — `order_detail_screen_test.dart`:** the MA-146 §10 scenarios:
   - confirmed checkout order: labels present; "Delivered", "Download Invoice", "Reorder Items" and "Leave Feedback" absent;
   - cancelled at the cut-off;
@@ -183,7 +190,8 @@ All three ship in **one code PR** (one feature branch, one commit per spec). MA-
 - **Widget — `scheduled_delivery_screen_test.dart`:**
   - "SCHEDULED DELIVERY", "Scheduled", "Estimated Total", "≈ ₹…", the caption, and "Manage subscription" → `/subscriptions`;
   - `becameOrder` → SnackBar "This delivery is now an order." + "View order" → replaces with `/orders/{id}`;
-  - `dateChanged` → "Your next delivery has changed.".
+  - `dateChanged` → "Your next delivery has changed.";
+  - deep link with `get` failing → "Couldn't load this delivery." + "Retry"; tapping Retry with the fake now succeeding → the loaded view.
 - **Router — extend `test/core/router/app_router_test.dart`:** `/orders/scheduled/sub_1` builds `ScheduledDeliveryScreen`, not `OrderDetailScreen('scheduled')`; `/orders/ord_1` builds `OrderDetailScreen`.
 
 **Acceptance check:** `flutter test test/features/orders test/core/router` passes; `flutter analyze` is clean. Manual check: open a real order from My Orders; its total matches the wallet debit in Wallet.
