@@ -156,6 +156,10 @@ There's one spec, built in this order (each step compiles and tests green on its
      - Catch **any** exception per line (`ApiException` or otherwise). Record the failure as
        `productNameFor(products, line.productId)`, which gives "Item" when the Catalog lookup
        failed, and continue with the next line.
+     - A client timeout counts as a failure too, even though a slow Cart Service may still
+       commit that add afterwards. The user then sees "Couldn't add {name}" for a line that
+       is in the cart, and a second Reorder (fresh keys) adds it again. This is accepted (§8);
+       keys are deliberately not reused across taps.
      - **Afterwards:** if not closed and the state is still `OrderDetailLoaded`, emit
        `copyWith(reordering: false)`. Return the `ReorderResult`.
      - If the state changed to not-found or an error during the run (a refresh), still return
@@ -175,7 +179,9 @@ There's one spec, built in this order (each step compiles and tests green on its
      - While `reordering`, the label is replaced by a small `CircularProgressIndicator`
        (strokeWidth 2, about 18dp).
      - Wrap the button in `Semantics(button: true, enabled: !reordering, label: 'Reorder Items',
-       ...)` so a screen reader still hears the name while it's busy (§5 accessibility).
+       excludeSemantics: reordering, ...)` so a screen reader still hears the name while it's
+       busy (§5 accessibility). `excludeSemantics` only while busy: when idle the button's own
+       label is announced, and excluding it then (or never) would announce it twice or drop it.
    - **Support button:** `OutlinedButton(key: Key('orderDetail.support'))`, labelled
      **"Support"**, with `onPressed: () => _openSupport(context, order.orderId)`. It's never
      disabled by Reorder.
@@ -190,9 +196,10 @@ There's one spec, built in this order (each step compiles and tests green on its
      - Build `Uri(scheme: 'mailto', path: AppConfig.supportEmail, query:
        'subject=${Uri.encodeComponent(subject)}')`. That gives `%20` for spaces, not `+`,
        which some mail clients show literally.
-     - If `await canLaunchUrl(uri)`, call `launchUrl(uri)`.
-     - Otherwise show the SnackBar **"No email app found. Contact us at
-       {AppConfig.supportEmail}."**
+     - Launched = `await canLaunchUrl(uri) && await launchUrl(uri)`, inside a try/catch that
+       treats a throw as not launched.
+     - If not launched (no mail app, `launchUrl` returned false, or it threw), show the
+       SnackBar **"No email app found. Contact us at {AppConfig.supportEmail}."**
      - Check `context.mounted` / use the captured messenger after each await.
 
 6. **`FakeCartRepository`**
@@ -212,7 +219,8 @@ There's one spec, built in this order (each step compiles and tests green on its
      - `bool canLaunchResult`;
      - `List<String> launched`;
      - override `canLaunch(url)` → `canLaunchResult`;
-     - override `launchUrl(url, options)` → record and return true.
+     - override `launchUrl(url, options)` → record, then throw `launchError` if set, else
+       return `launchResult` (default true), so tests cover a failed and a throwing launch.
    - Install it in `setUp` with `UrlLauncherPlatform.instance = fake`.
 
 **Tests to write:**
@@ -323,6 +331,7 @@ no numeric gate in this repo.
 | Support address is a placeholder | Shipped as `fromEnvironment` with a labelled default; Product/Support must confirm before release (spec Open Questions) — set via `--dart-define=SUPPORT_EMAIL=…` without a code change |
 | Sequential adds feel slow on a long order | Typical orders are 1–3 lines; the in-button spinner shows progress. If it becomes a problem, the fix is server-side (retry on `TransactionConflict`, or a batch-add endpoint), not reintroducing app-side parallelism |
 | Retry-all after a partial failure duplicates the lines that already succeeded | Accepted by the spec (§11); duplicates are normal, removable cart lines (§1 item 3) |
+| A timed-out add that the Cart Service commits late is reported as failed, and a retry adds it again | Accepted on the same basis: the cart shows the true contents and the duplicate is removable. Reusing per-line idempotency keys across taps would fix it but needs keys held in cubit state; revisit if support sees it |
 | `canLaunchUrl` false on a real device despite a mail app | Caused by missing platform declarations; covered by the §2 prerequisites — verify once on an Android 11+ device/emulator with Gmail |
 | `UrlLauncherPlatform.instance` fake leaking between tests | Install a fresh fake in each test's `setUp` |
 | Accidental `dart format` reflow | Don't run it (§1 item 9); check `git diff --stat` before committing |
