@@ -143,7 +143,8 @@ Two PRs (one per repo). The services PR merges first.
     when the year differs.
 - `lib/features/wallet/bloc/transaction_history_event.dart`: `HistoryOpened`,
   `HistoryRefreshed(completer)`, `FilterChanged(filter)`, `NextPageRequested`, `RetryBalance`,
-  `RetryLedger`.
+  `RetryLedger`, and the internal `OrderSourcesResolved(Map<String, OrderSource?>)` that the bloc
+  adds itself.
 - `lib/features/wallet/bloc/transaction_history_state.dart`:
   - `LoadStatus { loading, loaded, failed }` for the balance, and `LedgerStatus { loading,
     loaded, failed, walletNotReady }`;
@@ -158,14 +159,20 @@ Two PRs (one per repo). The services PR merges first.
     `ApiException` with `statusCode == 404` / `errorCode == 'WALLET_NOT_FOUND'` on the ledger →
     `walletNotReady`.
   - **Refreshed:** keeps the data on failure, bumps `refreshFailedCount`, completes the
-    completer.
+    completer. Like every first-page (re)load, it bumps the generation, so a page still in
+    flight is discarded (MA-149).
   - **FilterChanged:** a no-op if unchanged. Otherwise clear the entries and cursor, bump the
     generation, set ledger `loading`, and load the first page with the new types. The balance
     isn't reloaded.
   - **NextPageRequested** (`droppable()`): ignored when there's no cursor or the ledger isn't
-    loaded; a stale generation is discarded; failure → `PagingStatus.failed`.
+    loaded; a stale generation is discarded, and a stale result (success or failure) resets
+    `PagingStatus.loading` → `idle`. Otherwise a refresh that fails while a page is in flight
+    keeps the old state and leaves the spinner stuck. A current failure →
+    `PagingStatus.failed`.
   - **Order sources:** after each page, `getById` for unseen `orderId`s in parallel; failures
-    cache `null`.
+    cache `null`. The lookups run **unawaited**, and their results come back through
+    `OrderSourcesResolved`, which merges them into `orderSources`. If the `droppable()` paging
+    handler awaited them, load-more requests during the lookups would be silently dropped.
   - **RetryBalance / RetryLedger:** reload just that part.
 - `lib/features/wallet/presentation/transaction_history_screen.dart`:
   - `TransactionHistoryScreen({Clock? clock})` creates the bloc with `context.read<WalletRepository>()`
@@ -199,6 +206,8 @@ Two PRs (one per repo). The services PR merges first.
   `'${types?.join(',')}|$cursor'`, `listTransactionsException` (first page) and
   `pageException` (later pages), an optional `Completer` gate, and a `listTransactionsCalls`
   log of `(cursor, types)`.
+- `test/fakes/fake_order_repository.dart`: add an optional `getGate` `Completer` that holds
+  `getById` open, so a test can race order lookups against paging.
 - `lib/core/router/app_router.dart`: `/wallet/transactions` builds `AppConfig.walletEnabled ?
   const TransactionHistoryScreen() : const WalletComingSoon()`; the placeholder import is
   removed.
@@ -236,6 +245,10 @@ Two PRs (one per repo). The services PR merges first.
     were replaced, and the balance wasn't re-fetched;
   - paging appends; a duplicate request is dropped (gate);
   - a filter change during a gated page → the stale page is ignored;
+  - a refresh that fails while a page is gated → once the page lands, `PagingStatus` is `idle`
+    (not stuck `loading`), the entries are unchanged, and a new `NextPageRequested` fetches it;
+  - order lookups held open (a `getById` gate on the fake order repository) don't block the
+    next `NextPageRequested`; the sources merge once the gate opens;
   - one `getById` per distinct order across a debit and a refund of the same order, and across
     a refresh; `getById` throws → source cached null;
   - a refresh failure keeps the entries and bumps the counter.
@@ -254,8 +267,10 @@ Two PRs (one per repo). The services PR merges first.
     `/orders/ord_1`; tapping a top-up row pushes nothing;
   - ADD MONEY → `/wallet`; ADD MONEY disabled when the wallet status is `CREATING`.
 - **Router (`test/core/router/app_router_test.dart`):** `/wallet/transactions` builds
-  `TransactionHistoryScreen` (`WalletRepository` and `OrderRepository` fakes are added to the
-  harness's providers).
+  `WalletComingSoon` when the wallet is disabled (MA-149). `AppConfig.walletEnabled` is the
+  compile-time `bool.fromEnvironment('WALLET_ENABLED')` and is off in a plain `flutter test`,
+  so this is the case the test run can assert. The enabled branch (`TransactionHistoryScreen`) is covered
+  by the widget tests, which build the screen directly.
 
 **Acceptance check:** `flutter analyze` adds no issues beyond the existing info-level notes;
 `flutter test` is all green.
