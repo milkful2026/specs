@@ -28,10 +28,14 @@ result, and "Refund in progress" while a refund is still pending.
 2. **Neither service maps FastAPI's own validation errors to 400.** Pydantic body validation
    gives a **422** (Wallet's own test `test_internal_debit_non_positive_amount_is_422`
    shows this). MA-153 wants `400 VALIDATION_ERROR` / `400 INVALID_AMOUNT`, and MA-154
-   wants `400 VALIDATION_ERROR` for an unknown reason. So both request models declare their
-   fields loosely (optional, untyped where needed), and the handler or service validates by
-   hand and raises the typed 400. This is the same pattern as `_validate_order_id` and
-   checkout's `Idempotency-Key` check.
+   wants `400 VALIDATION_ERROR` for an unknown reason. `str | None` / `int | None` isn't loose
+   enough: Pydantic still 422s on a wrong type (`"abc"` or `1.5` for an int, `123` for a
+   string). So every body field in both request models is declared `Any = None`, and the
+   handler or service checks presence and type **before** any regex or range check and raises
+   the typed 400. This is the same pattern as `_validate_order_id` and checkout's
+   `Idempotency-Key` check. A body that isn't a JSON object at all still gets FastAPI's 422;
+   the only callers (Order Service's client, the app) always send an object, and an HTTP test
+   pins that behaviour.
 3. **The "integration" tests run on SQLite, not Postgres.** Both `wallet/tests/conftest.py`
    and `order/tests/conftest.py` use in-memory SQLite with `StaticPool` behind `TestClient`.
    MA-153 §10 and MA-154 §10 say "real Postgres". The plan writes those tests in the
@@ -62,6 +66,20 @@ result, and "Refund in progress" while a refund is still pending.
    add refunded orders to the day total. **Decided in chat (2026-10-08): exclude
    customer-cancelled orders from the day total**, while keeping their amount un-struck as
    the spec says (§4, MA-155 step 4).
+9. **The existing sweep flows have an attempt budget; MA-154's refund pass doesn't.**
+   `0003_sweep.sql` counts failed runs in `sweep_attempts` and escalates at
+   `ORDER_SWEEP_MAX_ATTEMPTS`. MA-154 FR-5 leaves a refund `PENDING` on every failure, so a
+   permanent data error (`REFUND_EXCEEDS_DEBIT`, `ORDER_USER_MISMATCH`) would be retried and
+   alarmed on every run, and once `batch_size` of them exist they'd fill every batch and
+   starve newer refunds. The plan adds `refund_attempts`, `refund_error` and
+   `refund_escalated_at` to `0004` (additive, so it stays within MA-154 §7's intent): data
+   errors escalate at once, transient failures escalate at the budget, and escalated rows
+   leave the sweep query and the age metric. `refund_state` stays `PENDING` (the customer
+   still sees "Refund in progress"; ops resolve it). This deviates from MA-154 §7's column
+   list; record it in the PR description.
+10. **`orderId`/`refundId` can't go straight into the regex validators.**
+    `_validate_order_id` calls `regex.match(value)`; `None` raises `TypeError` → 500, which
+    Order Service's client retries as a 5xx. Presence and type are checked first (finding 2).
 
 ---
 
@@ -196,20 +214,32 @@ an extra property (covered by the per-service tests below).
     `wallet.refund.count` with an `outcome` dimension. Log both on success and on
     `WalletError` (log, then re-raise). Mismatch is logged at error level (§9).
 - `wallet/src/handlers/dto.py`
-  - `RefundRequest(BaseModel)`: every field optional and loosely typed (`userId: str |
-    None`, `orderId: str | None`, `refundId: str | None`, `amountPaise: int | None`,
-    `correlationId: str | None`), with **no** `Field(gt=0)`, so bad input reaches the
-    hand-written 400s (finding 2).
+  - `RefundRequest(BaseModel)`: every field `Any = None` (`userId`, `orderId`, `refundId`,
+    `amountPaise`, `correlationId`), with **no** type annotation Pydantic would enforce and
+    no `Field(gt=0)`, so a missing or wrongly typed value reaches the hand-written 400s
+    instead of a 422 (finding 2). A comment on the class says why.
   - `serialize_refund(outcome) -> dict`: the FR-3 body (`orderId`, `refundId`, `status:
     "REFUNDED"`, `amountPaise`, `balanceAfterPaise`, `ledgerEntryId`, `refundedAt` ISO,
     `replayed`).
 - `wallet/src/handlers/internal_handlers.py`
   - Add `_REFUND_ID = re.compile(r"^[A-Za-z0-9_-]{1,32}$")` and
     `_validate_refund_id(...)`, which raises `InvalidOrderIdError` (`VALIDATION_ERROR`, 400).
-  - `@router.post("/wallet/internal/refunds")`: a missing or empty `userId` → 400
-    `VALIDATION_ERROR`; `_validate_order_id(orderId)`; `_validate_refund_id(refundId)`;
-    `amountPaise is None` → 400 `VALIDATION_ERROR`. Then call the service and return
-    `success_envelope(serialize_refund(...))`. Update the module docstring's route list.
+  - `_require_str(value, field) -> str`: not a `str`, or empty → `InvalidOrderIdError`
+    (`VALIDATION_ERROR`, 400) with `details={"field": field}`. Covers missing (`None`) and
+    wrongly typed (`123`, `[]`) values alike.
+  - `@router.post("/wallet/internal/refunds")`, validating in this order (finding 10):
+    1. `user_id = _require_str(body.userId, "userId")`, then the same for `orderId` and
+       `refundId`, **before** any regex;
+    2. `_validate_order_id(order_id)`; `_validate_refund_id(refund_id)`;
+    3. `amountPaise`: `None`, a `bool`, or not an `int` (`"abc"`, `1.5`) → 400
+       `VALIDATION_ERROR` (`details={"field": "amountPaise"}`); a non-positive `int` is left
+       to the service's `InvalidAmountError` (400 `INVALID_AMOUNT`);
+    4. `correlationId`: `None` or a `str`, anything else → 400 `VALIDATION_ERROR`.
+
+    Then call the service and return `success_envelope(serialize_refund(...))`. No input
+    reaches the service or a validator in a shape that can raise anything but a typed
+    `WalletError`, so a bad request never becomes a retryable 500. Update the module
+    docstring's route list.
 
 **Tests to write:**
 - Unit (`wallet/tests/unit/domain/test_wallet_service.py`, new `class TestRefundForOrder`,
@@ -238,9 +268,13 @@ an extra property (covered by the per-service tests below).
     amount and ref;
   - repeat the refund → 200 with `replayed: true`;
   - one test per FR-4 row, asserting status, `errorCode` and envelope shape: bad `orderId`
-    and bad `refundId` → 400 `VALIDATION_ERROR`; a missing field → 400; `amountPaise: 0` →
-    400 `INVALID_AMOUNT`; no wallet → 404; no debit → 409 `DEBIT_NOT_FOUND`; over-refund →
-    409 `REFUND_EXCEEDS_DEBIT` with `debitedPaise` in `data`; mismatch → 409;
+    and bad `refundId` → 400 `VALIDATION_ERROR`; `amountPaise: 0` → 400 `INVALID_AMOUNT`;
+    no wallet → 404; no debit → 409 `DEBIT_NOT_FOUND`; over-refund → 409
+    `REFUND_EXCEEDS_DEBIT` with `debitedPaise` in `data`; mismatch → 409;
+  - parametrized "never 422, never 500": each of `userId`, `orderId`, `refundId`,
+    `amountPaise` **omitted**, plus `orderId: 123`, `refundId: null`, `amountPaise: "abc"`,
+    `amountPaise: 1.5`, `amountPaise: true`, `correlationId: 5` → 400 `VALIDATION_ERROR`;
+  - a non-object body (`[]`) → 422 (pins the one documented exception, finding 2);
   - two threads posting the same refund → exactly one `REFUND` ledger row (finding 3: this
     proves the UNIQUE/replay path);
   - extend `test_internal_debit_routes_are_only_internal` (or add a sibling) so
@@ -289,8 +323,16 @@ tests/unit/adapters/test_wallet_client_adapter.py && ruff check .`. All pass.
   - `cancelled_at TIMESTAMPTZ NULL`;
   - `refund_state TEXT NULL CHECK (refund_state IN ('PENDING','REFUNDED','NOT_REQUIRED'))`;
   - `refunded_at TIMESTAMPTZ NULL`;
+  - `refund_attempts INTEGER NOT NULL DEFAULT 0` (failed **sweep** refund runs only; a
+    separate column, because `sweep_attempts` may already be non-zero from the debit flow);
+  - `refund_error TEXT NULL` (the last Wallet error code);
+  - `refund_escalated_at TIMESTAMPTZ NULL` (set once the refund needs a human; finding 9);
   - `CREATE INDEX orders_refund_pending ON orders (cancelled_at) WHERE refund_state =
-    'PENDING'`.
+    'PENDING' AND refund_escalated_at IS NULL`.
+
+  The header comment explains the three refund-budget columns the same way `0003` explains
+  `sweep_attempts`, including the ops recovery: fix the ledger, then clear
+  `refund_escalated_at` and reset `refund_attempts` so the sweep retries.
 
   Additive only, and immutable once merged.
 
@@ -301,8 +343,10 @@ tests/unit/adapters/test_wallet_client_adapter.py && ruff check .`. All pass.
    - `class RefundState(StrEnum)`: `PENDING`, `REFUNDED`, `NOT_REQUIRED`.
    - `FAILURE_CUSTOMER_CANCELLED = "CUSTOMER_CANCELLED"`.
    - `Order` gains `cancel_reason: CancelReason | None = None`, `cancelled_at: datetime |
-     None = None`, `refund_state: RefundState | None = None` and `refunded_at: datetime |
-     None = None`, all defaulted so existing constructors keep working.
+     None = None`, `refund_state: RefundState | None = None`, `refunded_at: datetime |
+     None = None`, `refund_attempts: int = 0`, `refund_error: str | None = None` and
+     `refund_escalated_at: datetime | None = None`, all defaulted so existing constructors
+     keep working. The last three are internal: `_serialize` doesn't expose them.
 2. `order/src/domain/cutoff.py` — `delivery_cutoff_moment(delivery_date, cutoff_hour_ist) ->
    datetime` (an aware IST datetime). Refactor `delivery_cutoff_passed` to call it, so FR-2
    and FR-7 share one definition (MA-154 FR-7).
@@ -311,7 +355,7 @@ tests/unit/adapters/test_wallet_client_adapter.py && ruff check .`. All pass.
    - `CutoffPassedError` (`CUTOFF_PASSED`, 409).
    - The existing `ValidationError` (400) is reused for an unknown reason.
 4. `order/src/adapters/order_repository.py`
-   - `orders_table` gets the four columns, plus the two `CheckConstraint`s mirroring `0004`.
+   - `orders_table` gets the seven columns, plus the two `CheckConstraint`s mirroring `0004`.
      Update the module docstring's migration list to include `0004`.
    - `_row_to_order` maps them, with a tolerant `None` for nulls.
    - `cancel_by_customer(order_id, *, reason, now, refund_state, outbox_payload) -> bool`:
@@ -324,26 +368,45 @@ tests/unit/adapters/test_wallet_client_adapter.py && ruff check .`. All pass.
      conditional `UPDATE ... WHERE id AND refund_state = 'PENDING'` (and `claim_owner =
      owner` when an owner is given), which also clears the lease (`**_LEASE_CLEARED`).
    - `list_pending_refunds(older_than_seconds, limit) -> list[str]`: `refund_state =
-     'PENDING' AND cancelled_at < db_now - N` and the lease free, oldest `cancelled_at`
-     first. Use `self._db_now_plus(-older_than_seconds)` (the database clock, as the other
-     sweep queries do).
+     'PENDING' AND refund_escalated_at IS NULL AND cancelled_at < db_now - N` and the lease
+     free, oldest `cancelled_at` first. Use `self._db_now_plus(-older_than_seconds)` (the
+     database clock, as the other sweep queries do). Escalated rows are excluded, so they
+     can never fill a batch (finding 9).
    - `claim_pending_refund(order_id, owner, lease_seconds) -> bool`: `self._claim(...)` with
-     `refund_state == 'PENDING'`.
+     `refund_state == 'PENDING'` and `refund_escalated_at IS NULL`.
+   - `record_refund_failure(order_id, owner, error_code, max_attempts) -> bool`: modelled on
+     the existing `record_order_sweep_failure` (`order_repository.py:657`), including its
+     `exhausted = ... + 1 >= max_attempts` / `case(...)` shape. One conditional `UPDATE ...
+     WHERE refund_state = 'PENDING' AND claim_owner = owner`: `refund_attempts + 1`,
+     `refund_error = error_code`, `**_LEASE_CLEARED`, and `refund_escalated_at = db_now`
+     when exhausted. Returns whether it escalated.
+   - `escalate_refund(order_id, error_code, *, owner=None) -> bool`: a conditional `UPDATE
+     ... WHERE refund_state = 'PENDING' AND refund_escalated_at IS NULL` (plus `claim_owner
+     = owner` when given) setting `refund_error`, `refund_escalated_at = db_now` and clearing
+     the lease. Returns whether it escalated, so the alarm fires exactly once.
    - `oldest_pending_refund_age_seconds() -> float | None`: for the
-     `order.refund.pending_age_seconds` metric.
+     `order.refund.pending_age_seconds` metric, over **non-escalated** `PENDING` rows only
+     (escalated ones have their own alarm and would otherwise hold the age alarm on).
+   - `count_escalated_refunds() -> int`: `PENDING` rows with `refund_escalated_at` set, for
+     the `order.refund.escalated_open` gauge.
    - Add the matching methods to `OrderRepositoryPort` in `adapters/interfaces.py`.
 5. `order/src/domain/order_service.py`
-   - The constructor gains keyword-only `cutoff_hour_ist: int = 20`, stored for FR-2/FR-7.
+   - The constructor gains keyword-only `cutoff_hour_ist: int = 20`, stored for FR-2/FR-7,
+     and `sweep_max_attempts: int = 6` (the refund budget; finding 9).
    - `cancel(order_id, user_id, reason: str | None, now: datetime, correlation_id: str) ->
      dict`:
-     - parse `reason`: `None` → `None`; not a `CancelReason` value → `ValidationError`
-       (`details={"field": "reason"}`);
+     - parse `reason` (typed `Any`, finding 2): `None` → `None`; not a `str` (`123`,
+       `[]`, `true`), or a string that isn't a `CancelReason` value → `ValidationError`
+       (`details={"field": "reason"}`). The `isinstance(reason, str)` check comes first, so
+       `CancelReason(123)` is never attempted;
      - load the order and apply FR-2 through a private `_check_cancellable(order, user_id,
        now)` that returns `"replay"` or raises `OrderNotFoundError` /
        `OrderNotCancellableError` (`details={"status": …}`) / `CutoffPassedError`
        (`details={"cancellableUntil": iso}`).
-     - Replay → if `refund_state == PENDING`, run `finish_refund(order, correlation_id)` first,
-       then return `_serialize(fresh order, now)`.
+     - Replay → if `refund_state == PENDING` **and `refund_escalated_at is None`**, run
+       `finish_refund(order, correlation_id)` first, then return `_serialize(fresh order,
+       now)`. An escalated refund isn't retried from the request path: it returns
+       `refundState: PENDING` ("Refund in progress") until ops resolve it.
      - Otherwise build the `OrderCancelled` payload (FR-6, `refundState` at cancel time;
        `items` only for `CHECKOUT`, as in `OrderConfirmed`) and call
        `repo.cancel_by_customer(...)`. `refund_state` is `PENDING` if `amount_paise > 0`,
@@ -362,11 +425,17 @@ tests/unit/adapters/test_wallet_client_adapter.py && ruff check .`. All pass.
      - `Refunded` → `mark_refund_state(REFUNDED, refunded_at=now)`, return `"refunded"`;
      - `DebitNotFoundError` → `mark_refund_state(NOT_REQUIRED)` plus a warning log, return
        `"not_required"`;
-     - `RefundExceedsDebitError` / `OrderUserMismatchError` → an error log with
-       `metric="order.refund.data_error"` (alarm), release the lease if an owner is given,
-       return `"error"`;
-     - `WalletUnavailableError` or any other `Exception` → leave it `PENDING`, release the
-       lease if an owner is given, return `"still_pending"`.
+     - `RefundExceedsDebitError` / `OrderUserMismatchError` → these are permanent, so
+       `escalate_refund(order.id, error_code, owner=owner)` at once (no budget). Only if
+       that returns `True`, log at error level with `metric="order.refund.data_error"`
+       (alarm), so each order alarms exactly once. Return `"escalated"`;
+     - `WalletUnavailableError` or any other `Exception` → leave it `PENDING`. With an owner
+       (the sweep), `record_refund_failure(order.id, owner, error_code,
+       self._sweep_max_attempts)`; if it returns `True` (budget reached), log
+       `metric="order.refund.escalated"` (alarm) and return `"escalated"`, else
+       `"still_pending"`. Without an owner (the request path), don't count it: the sweep's
+       budget, like `sweep_attempts`, counts sweep runs only. If `record_refund_failure`
+       itself fails, log and return `"still_pending"` (the lease expires on its own).
      - It never raises: the cancel request must still succeed (FR-3).
      - Emit `order.refund.outcome{outcome}`.
    - `get(...)` and `list_for_user(...)` gain an optional `now: datetime | None = None`
@@ -384,16 +453,20 @@ tests/unit/adapters/test_wallet_client_adapter.py && ruff check .`. All pass.
      (skip if it's lost); re-`get` it; if it's no longer `PENDING`, release and skip;
    - otherwise `outcome = self._order_service.finish_refund(order, correlation_id,
      owner=self._owner)` and count it under `refunded` / `not_required` / `still_pending` /
-     `error`;
+     `escalated`;
    - wrap each record in the existing "one record never stops the run" `try/except` with
      `_release_quietly`;
-   - after the loop, emit `order.refund.pending_age_seconds` with `value=` the oldest age
-     (or 0).
+   - after the loop, emit `order.refund.pending_age_seconds` with `value=` the oldest
+     non-escalated age (or 0), and `order.refund.escalated_open` with
+     `count_escalated_refunds()`.
+   - Because escalated rows leave `list_pending_refunds`, a batch is always made of
+     retryable refunds; a permanent error costs one Wallet call, ever (finding 9).
 7. `order/src/handlers/sweep.py` — add `("refund", service.finish_pending_refunds)` as the
    fourth pass, after `settle`.
 8. `order/src/handlers/order_handlers.py`
-   - `CancelRequest(BaseModel)` with `reason: str | None = None` (a string, not the enum,
-     so an unknown value reaches the service's 400 and not a 422).
+   - `CancelRequest(BaseModel)` with `reason: Any = None` (not the enum and not `str`, so an
+     unknown value **or a non-string** like `123` reaches the service's 400, not a 422;
+     finding 2).
    - `@router.post("/orders/{order_id}/cancel")` with `body: CancelRequest | None = None`,
      `request_id: str | None = Header(default=None, alias="x-request-id")`,
      `X-Correlation-Id` read the same way, `current_user_id`, and `get_order_service`.
@@ -404,8 +477,10 @@ tests/unit/adapters/test_wallet_client_adapter.py && ruff check .`. All pass.
      `/orders/checkout`; the checkout router is already included first.
 9. `order/src/handlers/dto.py` — update the docstring ("No request DTOs" is no longer true).
 10. `order/src/handlers/dependencies.py` — `get_order_service()` passes
-    `cutoff_hour_ist=settings.checkout_cutoff_hour_ist`.
-11. `order/README.md` — add the endpoint, the fourth sweep pass and the three metrics.
+    `cutoff_hour_ist=settings.checkout_cutoff_hour_ist` and
+    `sweep_max_attempts=settings.sweep_max_attempts` (the same budget the sweep uses).
+11. `order/README.md` — add the endpoint, the fourth sweep pass, the metrics, and the
+    refund escalation and its ops recovery (finding 9).
 
 **Tests to write:**
 - Unit (`order/tests/unit/domain/test_order_service.py`, a new `class TestCancel`, fixed
@@ -415,7 +490,8 @@ tests/unit/adapters/test_wallet_client_adapter.py && ruff check .`. All pass.
     `OrderCancelled` outbox row that passes `jsonschema.validate`; `wallet_client.refund_calls
     == [("user-1", id, "cancel", amount)]`; the returned dict has `refundState ==
     "REFUNDED"`, `cancellableUntil is None`;
-  - no reason → `cancel_reason is None`; `"LOL"` → `ValidationError`;
+  - no reason → `cancel_reason is None`; `"LOL"`, `123` and `["NOT_HOME"]` →
+    `ValidationError`;
   - `now` exactly at `delivery_cutoff_moment` → `CutoffPassedError`; one second before →
     succeeds;
   - non-owner → `OrderNotFoundError`; `CREATED`, `PAYMENT_FAILED`, and `CANCELLED` with
@@ -423,8 +499,12 @@ tests/unit/adapters/test_wallet_client_adapter.py && ruff check .`. All pass.
   - replay after `REFUNDED` → the same body, `refund_calls` still has one entry;
   - replay while `PENDING` (first call with `refund_exception = WalletUnavailableError(...)`,
     then cleared) → second call is `REFUNDED`, two refund calls;
-  - Wallet unavailable → returns normally with `refundState == "PENDING"`;
-    `DebitNotFoundError` → `NOT_REQUIRED`; `RefundExceedsDebitError` → stays `PENDING`;
+  - Wallet unavailable → returns normally with `refundState == "PENDING"`, and
+    `refund_attempts` is still 0 (the request path doesn't count);
+    `DebitNotFoundError` → `NOT_REQUIRED`; `RefundExceedsDebitError` and
+    `OrderUserMismatchError` → stay `PENDING` with `refund_escalated_at` set and
+    `refund_error` the code, and exactly one `order.refund.data_error` log;
+  - replay of an escalated order → no refund call, `refundState == "PENDING"`;
   - a ₹0 order (seed a `CONFIRMED` row with `amount_paise=0` directly through
     `orders_table`; no existing helper creates one) → `NOT_REQUIRED`, no refund call, and the
     event's `refundState == "NOT_REQUIRED"`;
@@ -432,21 +512,30 @@ tests/unit/adapters/test_wallet_client_adapter.py && ruff check .`. All pass.
     `delivery_date - 1` at 20:00 IST in ISO), `None` after it, `None` for `CANCELLED`.
 - Unit (`test_order_repository.py`): `cancel_by_customer` returns False and writes no outbox
   row when the order isn't `CONFIRMED`; `mark_refund_state` is a no-op once it's not
-  `PENDING`.
+  `PENDING`; `record_refund_failure` returns False below the budget and True at it (setting
+  `refund_escalated_at`), and is a no-op for another owner; `escalate_refund` returns True
+  once, then False; `list_pending_refunds` and `oldest_pending_refund_age_seconds` skip
+  escalated rows.
 - Cutoff (`test_order_service.py` or a new `test_cutoff.py`): `delivery_cutoff_moment(date(2026,
   10, 8), 20)` == 2026-10-07 20:00 IST; `delivery_cutoff_passed` is unchanged at the boundary.
 - Sweep (`order/tests/unit/domain/test_sweep_service.py`): a `PENDING` order whose
   `cancelled_at` is 2 min old → `refunded`; 30 s old → not listed; a lease held by another
-  owner → skipped; Wallet still down → `still_pending`, the lease released, still `PENDING`;
-  and `run_once` (`handlers/sweep.py`) includes the `refund.*` counts.
+  owner → skipped; Wallet still down → `still_pending`, the lease released, still `PENDING`,
+  `refund_attempts == 1`; down for `max_attempts` runs → `escalated` on the last, then not
+  listed again; a data error → `escalated` after one Wallet call, and the next run makes no
+  call; **starvation guard**: `batch_size` data-error orders older than one retryable order
+  → the first run escalates them, the second run refunds the retryable one; and `run_once`
+  (`handlers/sweep.py`) includes the `refund.*` counts.
 - Integration (`order/tests/integration/test_order_flow.py`, `TestClient` + SQLite,
   `FakeWalletClient` via the service fixture):
   - `POST /orders/{id}/cancel` with `{"reason": "NOT_HOME"}` → 200, then `GET /orders/{id}`
-    shows `cancelReason`, `cancelledAt`, `refundState`, and `cancellableUntil: null`;
+    shows `cancelReason`, `cancelledAt`, `refundState`, and `cancellableUntil: null` (and no
+    `refundAttempts`/`refundError` keys leak);
   - an empty body and no body both → 200;
   - every error: 404 (another user's JWT), 409 `ORDER_NOT_CANCELLABLE` with `status` in
     `data`, 409 `CUTOFF_PASSED` with `cancellableUntil`, 400 `VALIDATION_ERROR` for an
-    unknown reason. Assert the envelope shape;
+    unknown reason **and for `{"reason": 123}` / `{"reason": true}`** (never 422). Assert
+    the envelope shape;
   - two threads cancelling at once → one `OrderCancelled` outbox row, one winning `UPDATE`,
     and a final `refundState == "REFUNDED"`. Assert **1 ≤ refund calls ≤ 2**, not exactly one:
     if the loser's replay lands while the winner is still `PENDING`, it correctly runs its own
@@ -526,14 +615,21 @@ tests/unit/adapters/test_wallet_client_adapter.py && ruff check .`. All pass.
        `await refresh()`, and return the outcome;
      - anything else: clear `cancelling` and return `failed`.
 7. `lib/features/orders/bloc/scheduled_delivery_cubit.dart`
-   - `enum SkipOutcome { cancelled, cutoffPassed, alreadyOrder, failed }`.
-   - `Future<SkipOutcome?> cancelDelivery()`: only when `ScheduledDeliveryLoaded`; calls
+   - `enum SkipOutcome { cancelled, cutoffPassed, alreadyOrder, failed }`, and an
+     `Equatable` result `class SkipResult { SkipOutcome outcome; String? orderId; }`, where
+     `orderId` is non-null exactly when `outcome == alreadyOrder`.
+   - `Future<SkipResult?> cancelDelivery()`: only when `ScheduledDeliveryLoaded`; calls
      `_subscriptions.skip(subscriptionId, entry.date)`.
      - Success → `cancelled`.
-     - `ApiException(errorCode: 'CUTOFF_PASSED')` → `alreadyOrder` if `_clock() <
-       deliveryCutoff(entry.date)`, else `cutoffPassed`; then `await refresh()` (which
-       already detects `BecameOrder`).
+     - `ApiException(errorCode: 'CUTOFF_PASSED')` → `await refresh()` first, then decide
+       from the **server's** answer, never the phone clock: if the new state is
+       `ScheduledDeliveryLoaded` with `change is BecameOrder`, return `alreadyOrder` with
+       that `orderId`; anything else (no order found, the order lookup failed, the date
+       didn't move, `Gone`/`Error`) → `cutoffPassed`. A phone clock that's minutes off near
+       20:00 IST can't pick the wrong copy, and "View order" only appears when there's an
+       id to open.
      - Otherwise `failed`.
+   - `_clock` is still used for `istToday` as today; it no longer decides any outcome.
    - Add `alreadyOrder` to the outcomes: MA-155 FR-7 lists three, but FR-5's review fix
      needs the fourth to choose the copy.
 8. `lib/features/orders/presentation/order_detail_screen.dart`
@@ -558,17 +654,19 @@ tests/unit/adapters/test_wallet_client_adapter.py && ruff check .`. All pass.
      and `TextButton(key: Key('scheduled.cancel'))`; else the closed line.
    - `_cancelDelivery(context)`: an `AlertDialog(key: Key('cancelDelivery.dialog'))` with
      FR-5's title, body (product name or "Item") and buttons. On confirm, call
-     `cubit.cancelDelivery()` and map the outcome:
+     `cubit.cancelDelivery()` and map the result:
      - `cancelled` → SnackBar with **Shop for tomorrow**, then `context.pop()`;
-     - `cutoffPassed` / `alreadyOrder` → their copy;
+     - `cutoffPassed` → its copy, with no action;
+     - `alreadyOrder` → its copy with **View order** (below);
      - `failed` → "Couldn't cancel. Try again.".
    - SnackBar ordering for `alreadyOrder`: `cancelDelivery()` only returns after its
      `refresh()`, so the existing `BecameOrder` listener has already shown "This delivery is
      now an order." by then. The screen then calls `hideCurrentSnackBar()` and shows "This
-     delivery is already an order. Cancel it from the order instead." with the same **View
-     order** action (`pushReplacement('/orders/$orderId')`, the id taken from the state's
-     `BecameOrder` change). The user ends up seeing the spec's copy, with a way to reach the
-     order.
+     delivery is already an order. Cancel it from the order instead." with **View order** →
+     `pushReplacement('/orders/${result.orderId}')`. The id comes from the `SkipResult`
+     itself, which is only `alreadyOrder` when the refresh found the order, so the action
+     always has an order to open. The user ends up seeing the spec's copy, with a way to
+     reach the order.
 10. `lib/core/router/app_router.dart` — no route changes. `OrderDetailScreen`'s new `clock`
     is optional.
 11. `test/fakes/fake_order_repository.dart`
@@ -597,9 +695,16 @@ tests/unit/adapters/test_wallet_client_adapter.py && ruff check .`. All pass.
 - `cancel_copy_test.dart` (new, `test/features/orders/domain/`): the policy line for
   `DateTime.utc(2026,10,7,14,30)` → "Free cancellation until 8:00 PM, Wed 7 Oct"; the four
   labels; the three result messages.
-- `test/features/orders/bloc/detail_cubits_test.dart` — every MA-155 §10 cubit case, plus
-  `cancelDelivery` returning `alreadyOrder` when the fake skip throws `CUTOFF_PASSED` before
-  the cut-off, and `cutoffPassed` after it.
+- `test/features/orders/bloc/detail_cubits_test.dart` — every MA-155 §10 cubit case, plus,
+  with the fake skip throwing `CUTOFF_PASSED`:
+  - the refresh moves the date and `listMine` has an order for the old date →
+    `SkipResult(alreadyOrder, orderId: 'ord_…')`;
+  - the refresh moves the date but `listMine` has no such order, or throws →
+    `cutoffPassed`, `orderId == null`;
+  - the date doesn't move → `cutoffPassed`;
+  - **clock skew**: the injected clock reads 19:58 IST (phone behind the server) with no
+    order found → `cutoffPassed`; it reads 20:02 IST with an order found → `alreadyOrder`.
+    The outcome follows the server, not the clock.
 - `test/features/orders/presentation/detail_screens_test.dart` — every MA-155 §10 widget
   scenario. Pass `clock:` to `OrderDetailScreen` in the existing router helper (line ~126).
   The "cut-off passed on submit" scenario uses a mutable `DateTime` the clock closure reads,
@@ -621,8 +726,10 @@ at all.
   metrics), and the module docstrings noted per file.
 - **Alarms (record in the PR description for ops; no IaC exists for these services' metric
   filters yet):**
-  - `order.refund.pending_age_seconds > 900`;
-  - any `order.refund.data_error`;
+  - `order.refund.pending_age_seconds > 900` (non-escalated refunds only);
+  - any `order.refund.data_error` (fires once per order, at escalation);
+  - any `order.refund.escalated` (sweep budget exhausted), and
+    `order.refund.escalated_open > 0` as the "still unresolved" view;
   - `wallet.refund.count{outcome=ORDER_USER_MISMATCH}`.
 - **Lint:** `ruff check .` in `wallet/` and `order/`; `flutter analyze` in `milkful-app`.
 - **Full test runs:** each service's `pytest`, then the app's `flutter test`.
@@ -683,7 +790,9 @@ Every commit leaves its repo's tests green. End each commit message with the
 | Risk | Mitigation / recovery |
 |------|-----------------------|
 | Reusing Wallet's `DebitNotFoundError`/`OrderUserMismatchError` as-is would return 404/400 and break MA-154's 409 mapping | Refund-only 409 subclasses (finding 1); the HTTP tests assert the statuses |
-| FastAPI's 422 leaking out where the specs promise 400 | Loose request models plus hand validation (finding 2); the HTTP tests assert 400 |
+| FastAPI's 422 leaking out where the specs promise 400 | `Any`-typed request fields plus hand validation (finding 2); the parametrized HTTP tests assert 400 for missing and wrongly typed values. A non-object body is the one remaining 422, pinned by a test |
+| A malformed refund request becoming a retryable 500 | Presence/type checks before the regex validators (finding 10); "never 500" HTTP tests |
+| Permanent refund errors retried forever and starving the sweep batch | `refund_escalated_at` + `refund_attempts` budget; escalated rows leave the query and the age metric (finding 9); starvation-guard sweep test |
 | SQLite tests don't exercise `FOR UPDATE` or Postgres `CHECK`s | The local-dev E2E on Postgres (§6) is required before merge, not optional |
 | Unescaped `LIKE` counts another order's refunds (`_` wildcard) | `startswith(..., autoescape=True)` plus a dedicated `ord_1`/`ordX1` test |
 | The request's Step B and the sweep refunding the same order at once | The sweep's 60 s grace and lease; MA-153's `ref` idempotency makes a double call a replay, and `mark_refund_state` is conditional on `PENDING` |
@@ -692,3 +801,4 @@ Every commit leaves its repo's tests green. End each commit message with the
 | The architecture doc's `OrderCancelled → wallet-events-q` refund path added later by someone following the doc | Finding 7; the PR description says the refund is synchronous and that no wallet rule consumes `OrderCancelled` |
 | Production migration `0004` | Additive and nullable; needs the human approval in `services/README.md` §3.6 before deploy |
 | Scheduled Delivery showing two SnackBars when the delivery has become an order | MA-155 step 9 makes the cancel SnackBar carry "View order" for `alreadyOrder`; covered by the "already an order" widget scenario |
+| A skewed phone clock picking the wrong "cut-off passed" / "already an order" copy, or "View order" with no order id | The outcome comes from the post-refresh `BecameOrder(orderId)`, not the clock (MA-155 step 7); clock-skew cubit tests |
