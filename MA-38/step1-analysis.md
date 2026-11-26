@@ -106,7 +106,17 @@ Every Milkful delivery must produce a **GST-compliant tax invoice**. After each 
 - **Gapless numbering under concurrency.** This needs a per-financial-year counter with a transactional allocate-and-insert.
 - **Address snapshot source.** At order creation, Order needs the delivery address from User (an existing internal lookup or a new one).
 
-#### Impacted areas (Jira Components — not set on the ticket; proposed)
+#### Impacted areas (Jira Components: `services`, `mobile-app`)
+
+Spec layout follows the repo convention, with nothing new invented:
+
+```
+MA-38/step*.md                                 ← SDD workflow notes (this file, context, decomposition, review)
+services/tasks/MA/MA-38/{SPEC-KEY}.md          ← Catalog, Pricing, Order, Invoice service specs
+mobile-app/tasks/MA/MA-38/{SPEC-KEY}.md        ← Bill Details + Download Invoice spec
+{area}/tasks/MA/MA-38/impl-plan/               ← implementation plan beside its specs (after approval)
+```
+
 
 - **`services`:** Catalog (tax fields), Pricing (per-line tax and split), Order (breakdown and address snapshot), and a new Invoice service (job, numbering, PDF, API, `InvoiceGenerated` event).
 - **`mobile-app`:** Order Details Bill Details card, Download Invoice row, PDF open and share.
